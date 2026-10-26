@@ -1,0 +1,7 @@
+# =============================================================================
+# .gitattributes — Normalização de finais de linha
+# -----------------------------------------------------------------------------
+# POR QUE: O time pode desenvolver no Windows, mas o código roda em containers
+#          Linux. Forçar LF evita bugs com CRLF em scripts e diffs "fantasmas".
+# =============================================================================
+* text=auto eol=lf

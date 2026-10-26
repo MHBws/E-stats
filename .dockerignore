@@ -1,0 +1,19 @@
+# =============================================================================
+# .dockerignore — Arquivos excluídos do contexto de build da imagem
+# -----------------------------------------------------------------------------
+# POR QUE: Contexto menor = build mais rápido; e evita copiar node_modules do
+#          host (Windows/macOS) que é incompatível com o Alpine Linux, além de
+#          impedir que segredos (.env) acabem dentro da imagem.
+# =============================================================================
+node_modules
+dist
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+*.log
+coverage
+Dockerfile
+docker-compose*.yml
+README.md

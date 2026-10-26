@@ -1,0 +1,26 @@
+# =============================================================================
+# .gitignore — Arquivos que NUNCA devem ir para o repositório
+# =============================================================================
+
+# Dependências: reinstaladas via `npm ci` (pesadas e dependentes de plataforma).
+node_modules/
+
+# Saída de build do TypeScript (gerada por `npm run build`).
+dist/
+
+# Variáveis de ambiente reais: podem conter segredos. Versionamos só o .env.example.
+.env
+.env.*
+!.env.example
+
+# Logs e arquivos temporários.
+*.log
+npm-debug.log*
+coverage/
+
+# Arquivos de SO / IDE.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

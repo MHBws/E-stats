@@ -1,0 +1,108 @@
+# =============================================================================
+# docker-compose.yml — Ambiente de DESENVOLVIMENTO LOCAL
+# -----------------------------------------------------------------------------
+# O QUE: Orquestra os 3 serviços do BFF (api Node.js, PostgreSQL e Redis).
+# POR QUE: Garante que todo dev suba exatamente a mesma stack com um comando
+#          (`docker compose up --build`), sem instalar Postgres/Redis no host.
+# ATENÇÃO: Este arquivo NÃO é para produção (portas expostas, senhas fracas,
+#          bind mount de código-fonte). Produção terá um compose/manifest próprio.
+# Pré-requisito: copiar `.env.example` para `.env` (cp .env.example .env).
+# =============================================================================
+
+name: e-stats
+
+services:
+  # ---------------------------------------------------------------------------
+  # api — BFF Node.js/TypeScript com hot reload
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: e-stats-api
+    # Reaproveita as mesmas variáveis do .env usado no host, garantindo uma
+    # única fonte de verdade para credenciais de dev.
+    env_file:
+      - .env
+    environment:
+      # Dentro da rede do Compose os serviços se enxergam pelo NOME do serviço,
+      # não por "localhost". Sobrescrevemos apenas os hosts/portas internos.
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Escuta em todas as interfaces para o port mapping do Docker funcionar.
+      HOST: 0.0.0.0
+    ports:
+      - "3000:3000"
+    volumes:
+      # Bind mount APENAS de ./src: cada alteração local reflete no container
+      # e dispara o hot reload. Não montamos a raiz inteira para não sobrescrever
+      # o node_modules instalado na imagem (binários compilados para Linux/Alpine).
+      - ./src:/app/src
+      # tsconfig em modo somente leitura para refletir ajustes de compilação.
+      - ./tsconfig.json:/app/tsconfig.json:ro
+    depends_on:
+      # Só inicia a API quando banco e cache estiverem realmente prontos
+      # (healthcheck), evitando erros de conexão no boot.
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # db — PostgreSQL 16 (Alpine = imagem enxuta, pull/boot mais rápidos)
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: e-stats-db
+    # A imagem oficial lê POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB do .env
+    # para criar o usuário e o banco na primeira inicialização.
+    env_file:
+      - .env
+    ports:
+      # Exposta no host para uso de DB clients (DBeaver, TablePlus, psql...).
+      - "5432:5432"
+    volumes:
+      # Volume nomeado: dados sobrevivem a `docker compose down`
+      # (use `docker compose down -v` para zerar o banco).
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready confirma que o Postgres aceita conexões no banco configurado.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # redis — Redis 7 (cache quente + pub/sub do placar ao vivo)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: e-stats-redis
+    # Persistência básica:
+    #  --appendonly yes        -> AOF: registra cada escrita (perda máx. ~1s).
+    #  --appendfsync everysec  -> fsync a cada segundo: bom equilíbrio
+    #                             durabilidade x latência (crítica no placar).
+    #  --save 60 1000          -> snapshot RDB se houver 1000 escritas em 60s,
+    #                             acelerando o restart do container.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "60", "1000"]
+    ports:
+      # Exposta no host para uso de clients (RedisInsight, redis-cli...).
+      - "6379:6379"
+    volumes:
+      # Volume nomeado onde ficam os arquivos AOF/RDB.
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+# Volumes nomeados gerenciados pelo Docker (persistem entre recriações).
+volumes:
+  postgres_data:
+  redis_data:

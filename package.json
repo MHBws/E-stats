@@ -1,0 +1,49 @@
+{
+  "//": [
+    "JSON nao suporta comentarios nativos; a chave '//' e ignorada pelo npm e serve como documentacao.",
+    "type=module: usamos ESM nativo (padrao moderno do Node) para alinhar com tsconfig NodeNext.",
+    "Scripts:",
+    "  dev        -> hot reload no HOST com tsx watch (rapido, sem etapa de build).",
+    "  dev:docker -> hot reload DENTRO do container via nodemon --legacy-watch (polling).",
+    "               Polling e necessario porque bind mounts de disco Windows/macOS nao",
+    "               propagam eventos inotify para o container Linux.",
+    "  build/start-> compilacao tsc e execucao do JS (preparacao para producao futura).",
+    "  typecheck  -> validacao de tipos sem emitir arquivos (uso em CI/pre-commit).",
+    "Dependencias:",
+    "  fastify + @fastify/websocket -> HTTP de baixo overhead + WebSocket (baseado em 'ws'),",
+    "               escolhidos pela latencia minima exigida pelo placar ao vivo.",
+    "  pg -> driver PostgreSQL; redis -> cache/pub-sub do placar; dotenv -> carga do .env."
+  ],
+  "name": "e-stats-bff",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BFF de acompanhamento de Esports (CS2) com placar ao vivo de baixa latencia.",
+  "type": "module",
+  "main": "dist/server.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "dev:docker": "nodemon --legacy-watch --watch src --ext ts,json --exec tsx src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fastify/websocket": "^11.3.4",
+    "dotenv": "^18.0.9",
+    "fastify": "^5.12.7",
+    "pg": "^8.23.1",
+    "redis": "^6.3.0",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/pg": "^8.23.1",
+    "@types/ws": "^8.18.2",
+    "nodemon": "^3.1.14",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

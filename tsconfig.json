@@ -1,0 +1,44 @@
+// =============================================================================
+// tsconfig.json — Configuração do compilador TypeScript
+// -----------------------------------------------------------------------------
+// O QUE: Define como o TS valida e compila o código de src/ para dist/.
+// POR QUE: Em dev, o `tsx` executa o TS diretamente (sem usar este output),
+//          mas o `tsc` continua sendo a fonte da verdade para checagem de tipos
+//          (`npm run typecheck`) e para o build de produção (`npm run build`).
+// =============================================================================
+{
+  "compilerOptions": {
+    // ES2023: suportado nativamente pelo Node 22+, evita transpilação desnecessária.
+    "target": "ES2023",
+    "lib": ["ES2023"],
+
+    // NodeNext: resolução de módulos ESM idêntica à do Node em runtime
+    // (exige extensão .js nos imports relativos).
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    // Estrutura de saída do build.
+    "rootDir": "src",
+    "outDir": "dist",
+
+    // Modo estrito máximo: pega bugs em tempo de compilação, essencial em um
+    // sistema de tempo real onde erros em runtime custam caro.
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+
+    // Interoperabilidade com pacotes CommonJS (ex.: pg).
+    "esModuleInterop": true,
+    // Garante que cada arquivo pode ser transpilado isoladamente (requisito do tsx/esbuild).
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
