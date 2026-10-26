@@ -9,17 +9,17 @@
 //          As implementações concretas virão nos próximos módulos.
 // =============================================================================
 
-/** Jogos suportados. Foco inicial: CS2. */
-export type GameId = 'cs2';
-
-/** Identificadores dos provedores configurados no .env. */
-export type ProviderId = 'cito' | 'pandascore';
+// [UPDATE]: GameId, ProviderId e MatchStatus agora vêm do Modelo Canônico
+// (src/core/models.ts). O core não deve depender de providers; o inverso sim.
+// Re-exportamos para manter compatibilidade com quem já importava daqui.
+import type { GameId, MatchStatus, ProviderId } from '../core/models.js';
+export type { GameId, ProviderId };
 
 /** Estado normalizado de uma partida, independente do provedor de origem. */
 export interface MatchSnapshot {
   matchId: string;
   game: GameId;
-  status: 'scheduled' | 'live' | 'finished';
+  status: MatchStatus; // [UPDATE]: usa o enum canônico (inclui postponed/canceled)
   teams: [TeamScore, TeamScore];
   /** Timestamp (ms) da última atualização recebida do provedor. */
   updatedAt: number;

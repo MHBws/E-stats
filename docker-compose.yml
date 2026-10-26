@@ -68,9 +68,17 @@ services:
       # Volume nomeado: dados sobrevivem a `docker compose down`
       # (use `docker compose down -v` para zerar o banco).
       - postgres_data:/var/lib/postgresql/data
+      # [UPDATE]: Monta o schema inicial (Módulo 2). O entrypoint do Postgres
+      # executa scripts de /docker-entrypoint-initdb.d/ apenas com o volume
+      # VAZIO; para reaplicar alterações: `docker compose down -v`.
+      # :ro (somente leitura) impede que o container altere o arquivo do repo.
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       # pg_isready confirma que o Postgres aceita conexões no banco configurado.
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      # [UPDATE]: `-h localhost` força checagem via TCP. Durante a execução do
+      # init.sql o Postgres sobe um servidor temporário só no socket Unix; sem
+      # isso o healthcheck ficaria "healthy" antes do schema estar pronto.
+      test: ["CMD-SHELL", "pg_isready -h localhost -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10

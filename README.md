@@ -37,6 +37,15 @@ docker compose up --build     # sobe api + db + redis
 Alterações em `./src` disparam **hot reload** automaticamente no container.
 Alterações em `package.json` exigem rebuild: `docker compose up --build`.
 
+<!-- [UPDATE]: Seção adicionada no Módulo 2 (modelagem de dados e cache). -->
+## Dados
+
+- **Postgres** (`database/init.sql`): torneios, times, partidas, mapas e mapeamento de IDs dos provedores.
+  O script roda **apenas com o volume vazio**. Para reaplicar alterações: `docker compose down -v && docker compose up --build`.
+- **Redis** (`src/core/live-state.cache.ts`): snapshot ao vivo em `match:live:{matchId}` (TTL 12h)
+  e avisos de atualização no canal Pub/Sub `channel:match:{matchId}`.
+- **Modelo Canônico** (`src/core/models.ts`): tipos compartilhados, incluindo `CS2LiveState`.
+
 ## Rodando sem Docker para a API
 
 ```bash
