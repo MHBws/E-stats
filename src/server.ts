@@ -14,10 +14,20 @@ import { closeDatabase } from './core/database.js';
 import { closeRedis, connectRedis } from './core/redis.js';
 import { healthRoutes } from './api/health.routes.js';
 import { liveWsRoutes } from './api/live.ws.js';
+// [UPDATE]: Módulo 3 — Injeção de dependência do MappingService nos Adapters
+// (PandaScore REST e Cito Live Stream) para isolar o domínio de Esports.
+import { MappingService } from './core/mapping.service.js';
+import { PandaScoreAdapter } from './providers/pandascore/pandascore.adapter.js';
+import { CitoAdapter } from './providers/cito/cito.adapter.js';
 
 const app = Fastify({
   logger: { level: env.logLevel },
 });
+
+// [UPDATE]: Instanciação centralizada do serviço de mapeamento e dos adapters.
+const mappingService = new MappingService();
+const pandaScoreAdapter = new PandaScoreAdapter(mappingService);
+const citoAdapter = new CitoAdapter(mappingService);
 
 async function bootstrap(): Promise<void> {
   // Plugin de WebSocket (baseado na lib `ws`) deve ser registrado antes das rotas.
@@ -30,6 +40,17 @@ async function bootstrap(): Promise<void> {
   // Redis é obrigatório para o placar ao vivo: conecta antes de aceitar tráfego.
   await connectRedis();
 
+  // [UPDATE]: Módulo 3 — Inicializa os adapters de provedores externos e
+  // registra no log a prontidão da camada anticorrupção.
+  const upcomingPreview = await pandaScoreAdapter.fetchUpcomingMatches();
+  app.log.info(
+    {
+      providers: [pandaScoreAdapter.providerId, citoAdapter.providerId],
+      upcomingMatchesSimulated: upcomingPreview.length,
+    },
+    '[providers] Adapters PandaScore e Cito inicializados com MappingService',
+  );
+
   await app.listen({ host: env.host, port: env.port });
 }
 
@@ -37,6 +58,8 @@ async function bootstrap(): Promise<void> {
 async function shutdown(signal: string): Promise<void> {
   app.log.info(`[server] Sinal ${signal} recebido, encerrando...`);
   try {
+    // [UPDATE]: Módulo 3 — Encerra streams ativos da Cito antes de fechar o Redis.
+    citoAdapter.disconnectAll();
     await app.close(); // para de aceitar conexões e fecha os WebSockets
     await Promise.allSettled([closeRedis(), closeDatabase()]);
     process.exit(0);
