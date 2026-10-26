@@ -30,7 +30,9 @@ cp .env.example .env          # credenciais padrão de dev
 docker compose up --build     # sobe api + db + redis
 ```
 
-- API: http://localhost:3000/health
+- API Health: http://localhost:3000/health
+<!-- [UPDATE]: Módulo 5 — Documentação das rotas REST da Home Screen. -->
+- API REST (Partidas): `http://localhost:3000/api/matches` e `http://localhost:3000/api/matches/:id` (veja [`docs/API_REST_GUIDE.md`](docs/API_REST_GUIDE.md))
 - WebSocket: `ws://localhost:3000/ws/live/:matchId` (veja [`docs/CLIENT_WS_GUIDE.md`](docs/CLIENT_WS_GUIDE.md))
 - Postgres: `localhost:5432` | Redis: `localhost:6379`
 

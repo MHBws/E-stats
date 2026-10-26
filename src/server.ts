@@ -14,6 +14,9 @@ import { closeDatabase } from './core/database.js';
 import { closeRedis, connectRedis } from './core/redis.js';
 import { healthRoutes } from './api/health.routes.js';
 import { liveWsRoutes } from './api/live.ws.js';
+// [UPDATE]: Módulo 5 — Rotas REST de partidas (`/api/matches` e `/api/matches/:id`)
+// para alimentar os cards estilo Apple Sports da Home Screen mobile.
+import { matchRoutes } from './api/match.routes.js';
 // [UPDATE]: Módulo 3 — Injeção de dependência do MappingService nos Adapters
 // (PandaScore REST e Cito Live Stream) para isolar o domínio de Esports.
 import { MappingService } from './core/mapping.service.js';
@@ -36,6 +39,8 @@ async function bootstrap(): Promise<void> {
   // Rotas HTTP e WebSocket.
   await app.register(healthRoutes);
   await app.register(liveWsRoutes);
+  // [UPDATE]: Módulo 5 — Registra os endpoints REST sob o prefixo `/api`.
+  await app.register(matchRoutes, { prefix: '/api' });
 
   // Redis é obrigatório para o placar ao vivo: conecta antes de aceitar tráfego.
   await connectRedis();
