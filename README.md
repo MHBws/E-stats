@@ -31,7 +31,7 @@ docker compose up --build     # sobe api + db + redis
 ```
 
 - API: http://localhost:3000/health
-- WebSocket: `ws://localhost:3000/ws/live` (envie `{"type":"ping"}`)
+- WebSocket: `ws://localhost:3000/ws/live/:matchId` (veja [`docs/CLIENT_WS_GUIDE.md`](docs/CLIENT_WS_GUIDE.md))
 - Postgres: `localhost:5432` | Redis: `localhost:6379`
 
 Alterações em `./src` disparam **hot reload** automaticamente no container.
