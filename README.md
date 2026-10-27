@@ -1,5 +1,7 @@
 # E-stats — BFF de Esports (CS2)
 
+> **Versão Atual:** `1.0.0-pre-alpha` (Pré-alpha 1.0.0)
+
 Backend-for-Frontend do app de acompanhamento de Esports inspirado no Apple Sports.
 Prioridade máxima: **latência quase zero no placar ao vivo**.
 

@@ -15,7 +15,7 @@
     "  pg -> driver PostgreSQL; redis -> cache/pub-sub do placar; dotenv -> carga do .env."
   ],
   "name": "e-stats-bff",
-  "version": "0.1.0",
+  "version": "1.0.0-pre-alpha",
   "private": true,
   "description": "BFF de acompanhamento de Esports (CS2) com placar ao vivo de baixa latencia.",
   "type": "module",
