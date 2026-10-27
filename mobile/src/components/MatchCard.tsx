@@ -2,23 +2,31 @@
 // mobile/src/components/MatchCard.tsx — Card Minimalista de Partida (Apple Sports)
 // -----------------------------------------------------------------------------
 // O QUE: Componente clicável (`Pressable`) que exibe um confronto (`MatchCardDto`)
-//        com o campeonato no topo, indicador sutil "AO VIVO" e as duas equipes
-//        alinhadas horizontalmente com o placar/horário centralizado.
+//        com o campeonato e data/hora no topo (destacando jogos de "Hoje" em
+//        verde `#22c55e`), indicador "AO VIVO" e as duas equipes alinhadas às
+//        extremidades com seus logotipos (`48x48`, fallback para sigla) e o
+//        placar/VS centralizado.
 //
 // POR QUE (Escolhas de Flexbox & Otimização de Re-renderização):
 //   1. Flexbox Simétrico (`flexDirection: 'row', justifyContent: 'space-between'`):
 //      Em telas mobile estreitas, nomes de times com tamanhos diferentes
 //      (ex.: "G2" vs "Natus Vincere") costumam deslocar o placar do centro real.
-//      Atribuímos `flex: 1` para cada bloco de time (esquerdo e direito) e
-//      largura fixa/centralizada para o bloco do placar central — garantindo que
-//      o placar fique geometricamente cravado no centro do card como no Apple Sports.
-//   2. `React.memo`: Na Home Screen, uma `FlatList` pode conter dezenas de cards.
+//      Atribuímos `flex: 1` para cada bloco de time (esquerdo com `flex-start`
+//      e direito com `flex-end`) e largura fixa/centralizada para o bloco do
+//      placar central — garantindo que o placar/VS fique geometricamente cravado
+//      no centro do card como no Apple Sports.
+//   2. Dimensões Fixas de Imagem (`width: 48, height: 48` + `resizeMode="contain"`):
+//      Evita "layout shift" (pulo visual) enquanto os logotipos carregam pela
+//      rede e mantém o alinhamento vertical idêntico mesmo quando um time usa
+//      logo e o adversário cai no fallback textual da sigla.
+//   3. `React.memo`: Na Home Screen, uma `FlatList` pode conter dezenas de cards.
 //      Envolver `MatchCard` em `React.memo` evita que cards inalterados sofram
 //      re-renderização durante o Pull-to-Refresh ou atualizações pontuais.
 // =============================================================================
-import React, { memo } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
-import type { MatchCardDto } from '../types/match';
+import React, { memo, useEffect, useState } from 'react';
+// [UPDATE]: Importa `Image` do React Native para renderizar os escudos dos times.
+import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
+import type { MatchCardDto, MatchTeamSummary } from '../types/match';
 
 export interface MatchCardProps {
   match: MatchCardDto;
@@ -26,23 +34,89 @@ export interface MatchCardProps {
   onPress?: (match: MatchCardDto) => void;
 }
 
-/** Formata o horário agendado (`HH:mm`) para partidas que ainda não iniciaram. */
-function formatScheduledTime(isoDate: string): string {
+/**
+ * [UPDATE]: Analisa a data/hora da partida (`scheduled_at` / `beginAt`) e
+ * identifica se o confronto ocorre no dia atual (Hoje) no fuso local do usuário.
+ */
+interface FormattedSchedule {
+  isToday: boolean;
+  dateLabel: string;
+  timeLabel: string;
+}
+
+function formatMatchSchedule(isoDate: string): FormattedSchedule {
   const date = new Date(isoDate);
-  if (Number.isNaN(date.getTime())) return '--:--';
+  if (Number.isNaN(date.getTime())) {
+    return {
+      isToday: false,
+      dateLabel: '--/--',
+      timeLabel: '--:--',
+    };
+  }
+
+  const now = new Date();
+  const isToday =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+
   const hours = String(date.getHours()).padStart(2, '0');
   const minutes = String(date.getMinutes()).padStart(2, '0');
-  return `${hours}:${minutes}`;
+  const timeLabel = `${hours}:${minutes}`;
+
+  const day = String(date.getDate()).padStart(2, '0');
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const dateLabel = `${day}/${month}`;
+
+  return {
+    isToday,
+    dateLabel,
+    timeLabel,
+  };
+}
+
+/**
+ * [UPDATE]: Determina a sigla de fallback caso `logo_url` seja nulo ou falhe ao
+ * carregar. Se a equipe existir mas não tiver `acronym` cadastrado na API,
+ * extrai as 3 primeiras letras do nome para não exibir "TBD" indevidamente.
+ */
+function resolveTeamFallbackAcronym(team: MatchTeamSummary | null): string {
+  if (!team) return 'TBD';
+  const trimmedAcronym = team.acronym?.trim();
+  if (trimmedAcronym) return trimmedAcronym;
+  const trimmedName = team.name?.trim();
+  if (trimmedName) return trimmedName.slice(0, 3).toUpperCase();
+  return 'TBD';
 }
 
 function MatchCardComponent({ match, onPress }: MatchCardProps): React.JSX.Element {
   const isLive = match.status === 'live';
   const isFinished = match.status === 'finished';
 
-  const teamAAcronym = match.team_a?.acronym ?? 'TBD';
+  // [UPDATE]: Controla falhas de carregamento HTTP de cada logo (`onError`) para
+  // acionar automaticamente o fallback textual da sigla sem quebrar o card.
+  const [teamALogoError, setTeamALogoError] = useState<boolean>(false);
+  const [teamBLogoError, setTeamBLogoError] = useState<boolean>(false);
+
+  const teamALogoUrl = match.team_a?.logo_url?.trim() || null;
+  const teamBLogoUrl = match.team_b?.logo_url?.trim() || null;
+
+  useEffect(() => {
+    setTeamALogoError(false);
+  }, [teamALogoUrl]);
+
+  useEffect(() => {
+    setTeamBLogoError(false);
+  }, [teamBLogoUrl]);
+
+  const teamAAcronym = resolveTeamFallbackAcronym(match.team_a);
   const teamAName = match.team_a?.name ?? 'A definir';
-  const teamBAcronym = match.team_b?.acronym ?? 'TBD';
+  const teamBAcronym = resolveTeamFallbackAcronym(match.team_b);
   const teamBName = match.team_b?.name ?? 'A definir';
+
+  const schedule = formatMatchSchedule(match.scheduled_at);
+  const showTeamALogo = Boolean(teamALogoUrl) && !teamALogoError;
+  const showTeamBLogo = Boolean(teamBLogoUrl) && !teamBLogoError;
 
   return (
     // [UPDATE]: Módulo 8 — `Pressable` nativo com feedback tátil de opacidade
@@ -56,7 +130,7 @@ function MatchCardComponent({ match, onPress }: MatchCardProps): React.JSX.Eleme
         pressed && styles.cardPressed,
       ]}
     >
-      {/* Topo do Card: Nome do Campeonato (pequeno e cinza #8E8E93) + Badge AO VIVO */}
+      {/* Topo do Card: Nome do Campeonato (esquerda) + Status/Data/Hora (direita) */}
       <View style={styles.headerRow}>
         <Text style={styles.tournamentText} numberOfLines={1}>
           {match.tournament.name}
@@ -68,21 +142,41 @@ function MatchCardComponent({ match, onPress }: MatchCardProps): React.JSX.Eleme
             <View style={styles.liveDot} />
             <Text style={styles.liveBadgeText}>AO VIVO</Text>
           </View>
-        ) : (
+        ) : isFinished ? (
+          <Text style={styles.statusText}>ENCERRADO</Text>
+        ) : schedule.isToday ? (
+          // [UPDATE]: Destaque verde (#22c55e) para partidas que acontecem Hoje.
           <Text style={styles.statusText}>
-            {isFinished ? 'ENCERRADO' : formatScheduledTime(match.scheduled_at)}
+            <Text style={styles.todayText}>Hoje</Text>
+            <Text style={styles.statusText}> • {schedule.timeLabel}</Text>
+          </Text>
+        ) : (
+          // [UPDATE]: Exibe data (DD/MM) + horário para partidas de outros dias.
+          <Text style={styles.statusText}>
+            {schedule.dateLabel} • {schedule.timeLabel}
           </Text>
         )}
       </View>
 
-      {/* Corpo Principal: Time A | Placar Central | Time B */}
+      {/* Corpo Principal: Time A (Logo + Nome) | Placar/VS Central | Time B (Logo + Nome) */}
       <View style={styles.matchupRow}>
         {/* Coluna Esquerda (Time A) — `flex: 1` mantém simetria com o lado direito */}
         <View style={styles.teamColumnLeft}>
-          <Text style={styles.teamAcronym} numberOfLines={1}>
-            {teamAAcronym}
-          </Text>
-          <Text style={styles.teamFullName} numberOfLines={1}>
+          <View style={styles.logoSlot}>
+            {showTeamALogo && teamALogoUrl ? (
+              <Image
+                source={{ uri: teamALogoUrl }}
+                style={styles.teamLogo}
+                resizeMode="contain"
+                onError={() => setTeamALogoError(true)}
+              />
+            ) : (
+              <Text style={styles.teamAcronymFallback} numberOfLines={1}>
+                {teamAAcronym}
+              </Text>
+            )}
+          </View>
+          <Text style={styles.teamFullNameLeft} numberOfLines={1}>
             {teamAName}
           </Text>
         </View>
@@ -103,10 +197,21 @@ function MatchCardComponent({ match, onPress }: MatchCardProps): React.JSX.Eleme
 
         {/* Coluna Direita (Time B) — `flex: 1` + alinhamento à direita */}
         <View style={styles.teamColumnRight}>
-          <Text style={styles.teamAcronym} numberOfLines={1}>
-            {teamBAcronym}
-          </Text>
-          <Text style={styles.teamFullName} numberOfLines={1}>
+          <View style={styles.logoSlotRight}>
+            {showTeamBLogo && teamBLogoUrl ? (
+              <Image
+                source={{ uri: teamBLogoUrl }}
+                style={styles.teamLogo}
+                resizeMode="contain"
+                onError={() => setTeamBLogoError(true)}
+              />
+            ) : (
+              <Text style={styles.teamAcronymFallback} numberOfLines={1}>
+                {teamBAcronym}
+              </Text>
+            )}
+          </View>
+          <Text style={styles.teamFullNameRight} numberOfLines={1}>
             {teamBName}
           </Text>
         </View>
@@ -173,7 +278,12 @@ const styles = StyleSheet.create({
     color: '#8E8E93',
     fontSize: 11,
     fontWeight: '700',
-    letterSpacing: 0.5,
+    letterSpacing: 0.4,
+  },
+  // [UPDATE]: Estilo verde (#22c55e) em negrito para destacar jogos que ocorrem "Hoje".
+  todayText: {
+    color: '#22c55e',
+    fontWeight: 'bold',
   },
   matchupRow: {
     flexDirection: 'row',
@@ -190,17 +300,41 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
     paddingLeft: 8,
   },
-  teamAcronym: {
+  // [UPDATE]: Slot de altura fixa (48px) mantém simetria vertical entre logo e fallback de sigla.
+  logoSlot: {
+    minHeight: 48,
+    justifyContent: 'center',
+    alignItems: 'flex-start',
+    marginBottom: 6,
+  },
+  logoSlotRight: {
+    minHeight: 48,
+    justifyContent: 'center',
+    alignItems: 'flex-end',
+    marginBottom: 6,
+  },
+  // [UPDATE]: Dimensões fixas 48x48 para o escudo da equipe.
+  teamLogo: {
+    width: 48,
+    height: 48,
+  },
+  teamAcronymFallback: {
     color: '#FFFFFF',
     fontSize: 22,
     fontWeight: '800',
     letterSpacing: 0.3,
   },
-  teamFullName: {
+  teamFullNameLeft: {
     color: '#8E8E93',
     fontSize: 12,
     fontWeight: '500',
-    marginTop: 2,
+    textAlign: 'left',
+  },
+  teamFullNameRight: {
+    color: '#8E8E93',
+    fontSize: 12,
+    fontWeight: '500',
+    textAlign: 'right',
   },
   scoreCenterBox: {
     minWidth: 76,

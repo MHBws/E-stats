@@ -73,8 +73,9 @@ export function HomeScreen({ navigation }: HomeScreenProps): React.JSX.Element {
   // Memoizado com `useCallback` para preservar a otimização `React.memo` do `MatchCard`.
   const handlePressMatch = useCallback(
     (match: MatchCardDto): void => {
-      const teamA = match.team_a?.acronym ?? 'TBD';
-      const teamB = match.team_b?.acronym ?? 'TBD';
+      // [UPDATE]: Fallback para o nome completo quando a equipe não possui sigla na API.
+      const teamA = match.team_a?.acronym ?? match.team_a?.name ?? 'TBD';
+      const teamB = match.team_b?.acronym ?? match.team_b?.name ?? 'TBD';
       navigation.navigate('LiveMatch', {
         matchId: match.id,
         title: `${teamA} vs ${teamB}`,
