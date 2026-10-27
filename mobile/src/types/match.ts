@@ -115,6 +115,19 @@ export interface CS2TeamEconomy {
   buyType: CS2BuyType | null;
 }
 
+// [UPDATE]: Módulo 8 — Estatísticas individuais de jogador (K/D/A e Bank)
+// para exibição no resumo rolável da `LiveMatchScreen`.
+export interface CS2PlayerLiveStats {
+  playerId: string;
+  nickname: string;
+  kills: number;
+  deaths: number;
+  assists: number;
+  /** Dinheiro atual do jogador no round (Bank em $). */
+  money: number;
+  alive: boolean;
+}
+
 export interface CS2TeamLiveState {
   teamId: UUID;
   name: string;
@@ -124,6 +137,8 @@ export interface CS2TeamLiveState {
   mapsWon: number;
   playersAlive: number;
   economy: CS2TeamEconomy;
+  // [UPDATE]: Módulo 8 — Lista opcional de jogadores do time com K/D/A e Bank.
+  players?: CS2PlayerLiveStats[];
 }
 
 export interface CS2BombStatus {
@@ -168,6 +183,9 @@ export interface CS2LiveState {
     phase: CS2RoundPhase;
     clock: CS2Clock;
   };
+  // [UPDATE]: Módulo 8 — Alias opcional em ms na raiz para compatibilidade direta
+  // com leitores que buscam `round_time_remaining_ms` ou `round.clock.remainingMs`.
+  round_time_remaining_ms?: number;
   teams: {
     teamA: CS2TeamLiveState;
     teamB: CS2TeamLiveState;
@@ -199,3 +217,12 @@ export type LiveServerMessage =
       type: 'error';
       message: string;
     };
+
+// [UPDATE]: Módulo 8 — Tipagem das rotas do Native Stack Navigator (iOS/Android).
+export type RootStackParamList = {
+  Home: undefined;
+  LiveMatch: {
+    matchId: string;
+    title?: string;
+  };
+};
