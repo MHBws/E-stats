@@ -69,7 +69,10 @@ async function bootstrap(): Promise<void> {
   scheduleLiveWatchdog(citoAdapter);
   app.log.info('[workers] Cron jobs iniciados (PandaScore 6h sync + Live Watchdog 1m)');
 
-  await app.listen({ host: env.host, port: env.port });
+  // [UPDATE]: Garante bind explícito em `0.0.0.0` (todas as interfaces IPv4)
+  // para que o port-forwarding do Docker e o loopback `10.0.2.2` do emulador
+  // Android alcancem o Fastify sem bloqueio de loopback local (`127.0.0.1`).
+  await app.listen({ host: '0.0.0.0', port: env.port });
 }
 
 /** Encerra servidor e conexões de forma ordenada. */

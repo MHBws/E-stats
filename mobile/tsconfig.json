@@ -1,17 +1,13 @@
-// =============================================================================
-// mobile/tsconfig.json — Configuração TypeScript do App Mobile (Expo)
-// -----------------------------------------------------------------------------
-// O QUE: Define as regras de compilação e checagem de tipos para React Native.
-// POR QUE: Garante tipagem estrita ponta a ponta entre os DTOs do BFF (`MatchCardDto`,
-//          `CS2LiveState`) e os hooks/componentes da UI estilo Apple Sports.
-// =============================================================================
 {
   "compilerOptions": {
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
-    "lib": ["ES2023", "DOM"],
+    "lib": [
+      "ES2023",
+      "DOM"
+    ],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
@@ -23,6 +19,13 @@
     "isolatedModules": true,
     "noEmit": true
   },
-  "include": ["App.tsx", "src/**/*.ts", "src/**/*.tsx"],
-  "exclude": ["node_modules"]
+  "include": [
+    "App.tsx",
+    "src/**/*.ts",
+    "src/**/*.tsx"
+  ],
+  "exclude": [
+    "node_modules"
+  ],
+  "extends": "expo/tsconfig.base"
 }

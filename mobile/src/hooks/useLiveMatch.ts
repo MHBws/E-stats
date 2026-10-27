@@ -2,7 +2,7 @@
 // mobile/src/hooks/useLiveMatch.ts — Hook de Tempo Real do Placar ao Vivo (WS)
 // -----------------------------------------------------------------------------
 // O QUE: Custom Hook React (`useLiveMatch(matchId)`) que gerencia o ciclo de
-//        vida completo do WebSocket em `ws://localhost:3000/ws/live/${matchId}`,
+//        vida completo do WebSocket em `ws://10.0.2.2:3000/ws/live/${matchId}`,
 //        expondo `{ liveState, isConnected, error }`.
 // POR QUE:
 //   1. Estado Completo sem Diffs: Aplica o snapshot `CS2LiveState` diretamente
@@ -18,8 +18,9 @@
 import { useEffect, useRef, useState } from 'react';
 import type { CS2LiveState, LiveServerMessage } from '../types/match';
 
-/** URL base do WebSocket para desenvolvimento local. */
-export const WS_BASE_URL = 'ws://localhost:3000/ws/live';
+// [UPDATE]: Usa o IP de loopback do Emulador Android (`10.0.2.2`) para alcançar
+// a porta 3000 exposta pelo container Docker na máquina hospedeira.
+export const WS_BASE_URL = 'ws://10.0.2.2:3000/ws/live';
 
 /** Limite máximo de espera entre tentativas de reconexão (16 segundos). */
 const MAX_BACKOFF_MS = 16_000;

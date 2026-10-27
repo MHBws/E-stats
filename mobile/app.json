@@ -11,7 +11,11 @@
       "bundleIdentifier": "app.estats.mobile"
     },
     "android": {
-      "package": "app.estats.mobile"
-    }
+      "package": "app.estats.mobile",
+      "usesCleartextTraffic": true
+    },
+    "plugins": [
+      "expo-asset"
+    ]
   }
 }

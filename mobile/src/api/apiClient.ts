@@ -2,7 +2,7 @@
 // mobile/src/api/apiClient.ts — Cliente HTTP REST do App Mobile
 // -----------------------------------------------------------------------------
 // O QUE: Centraliza as chamadas HTTP (`fetch` nativo do React Native) para o
-//        BFF em `http://localhost:3000/api`, expondo `fetchMatches(status?)` e
+//        BFF em `http://10.0.2.2:3000/api`, expondo `fetchMatches(status?)` e
 //        `fetchMatchById(id)`.
 // POR QUE: Usar o `fetch` nativo do Hermes/React Native evita adicionar peso ao
 //          bundle (sem axios) e concentra tratamento de erro, headers e URL base
@@ -10,8 +10,10 @@
 // =============================================================================
 import type { MatchCardDto, MatchDetailDto } from '../types/match';
 
-/** URL base padrão para desenvolvimento local (iOS Simulator / Web). */
-export const API_BASE_URL = 'http://localhost:3000/api';
+// [UPDATE]: Usa o IP especial de loopback do Emulador Android (`10.0.2.2`), que
+// roteia diretamente para o `127.0.0.1` da máquina hospedeira onde o Docker expõe
+// a porta 3000. Corrigido também formato de string pura (sem sintaxe Markdown).
+export const API_BASE_URL = 'http://10.0.2.2:3000/api';
 
 /**
  * Wrapper genérico de `fetch` com cabeçalhos JSON e tratamento de status HTTP.
