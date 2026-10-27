@@ -58,8 +58,10 @@ export const env = Object.freeze({
 
   providers: {
     citoApiKey: required('CITO_API_KEY'),
-    pandaScoreApiKey: required('PANDASCORE_API_KEY'),
+    pandaScoreApiKey: optional('PANDASCORE_API_KEY', ''),
   },
+  // [UPDATE]: Exposição direta de `PANDASCORE_API_KEY` para validação explícita no adapter.
+  PANDASCORE_API_KEY: optional('PANDASCORE_API_KEY', ''),
 } as const);
 
 export type Env = typeof env;

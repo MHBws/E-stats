@@ -54,13 +54,10 @@ async function bootstrap(): Promise<void> {
   // Redis é obrigatório para o placar ao vivo: conecta antes de aceitar tráfego.
   await connectRedis();
 
-  // [UPDATE]: Módulo 3 — Inicializa os adapters de provedores externos e
-  // registra no log a prontidão da camada anticorrupção.
-  const upcomingPreview = await pandaScoreAdapter.fetchUpcomingMatches();
+  // [UPDATE]: Registra no log a prontidão dos adapters sem disparar fetch duplicado no boot.
   app.log.info(
     {
       providers: [pandaScoreAdapter.providerId, citoAdapter.providerId],
-      upcomingMatchesSimulated: upcomingPreview.length,
     },
     '[providers] Adapters PandaScore e Cito inicializados com MappingService',
   );

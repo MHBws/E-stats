@@ -27,6 +27,8 @@
 //     publicando eventos repetidos no Redis Pub/Sub e vazando memória.
 // =============================================================================
 import cron, { type ScheduledTask } from 'node-cron';
+// [UPDATE]: Consulta real ao PostgreSQL no Watchdog ao vivo.
+import { db } from '../core/database.js';
 import { MappingService, mappingService } from '../core/mapping.service.js';
 import { CitoAdapter } from '../providers/cito/cito.adapter.js';
 import { PandaScoreAdapter } from '../providers/pandascore/pandascore.adapter.js';
@@ -107,42 +109,33 @@ export async function runLiveWatchdogOnce(
     const now = Date.now();
     const fifteenMinutesMs = 15 * 60 * 1_000;
 
-    // -------------------------------------------------------------------------
-    // [SIMULAÇÃO DA QUERY SQL DO WATCHDOG]
-    // No banco PostgreSQL, buscamos partidas em andamento (`status = 'live'`)
-    // ou prestes a iniciar nos próximos 15 minutos (`status IN ('upcoming', 'scheduled')`):
-    //
-    // const { rows } = await db.query<WatchdogCandidateMatch>(`
-    //   SELECT
-    //     m.id,
-    //     COALESCE(pm.external_id, m.id::text) AS "externalCitoId",
-    //     m.status,
-    //     m.scheduled_at AS "scheduledAt"
-    //   FROM matches m
-    //   LEFT JOIN provider_mappings pm
-    //     ON pm.entity_id = m.id
-    //    AND pm.entity_type = 'match'
-    //    AND pm.provider = 'cito'
-    //   WHERE m.status = 'live'
-    //      OR (
-    //        m.status IN ('upcoming', 'scheduled')
-    //        AND m.scheduled_at <= NOW() + INTERVAL '15 minutes'
-    //        AND m.scheduled_at >= NOW() - INTERVAL '2 hours'
-    //      )
-    // `);
-    // -------------------------------------------------------------------------
-    const simulatedCandidates: WatchdogCandidateMatch[] = [
-      {
-        id: '00000000-0000-4000-8000-000000000001',
-        externalCitoId: 'cito_match_990001',
-        status: 'upcoming',
-        // 10 minutos no futuro (dentro da janela de 15 minutos).
-        scheduledAt: new Date(now + 10 * 60 * 1_000),
-      },
-    ];
+    // [UPDATE]: Consulta real no banco PostgreSQL buscando partidas `live` ou
+    // prestes a iniciar nos próximos 15 minutos (`scheduled` / `upcoming`).
+    const { rows: candidates } = await db.query<WatchdogCandidateMatch>(`
+      SELECT
+        m.id,
+        COALESCE(pm.external_id, m.id::text) AS "externalCitoId",
+        m.status,
+        m.scheduled_at AS "scheduledAt"
+      FROM matches m
+      LEFT JOIN provider_mappings pm
+        ON pm.entity_id = m.id
+       AND pm.entity_type = 'match'
+       AND pm.provider = 'cito'
+      WHERE m.status = 'live'
+         OR (
+           m.status IN ('upcoming', 'scheduled')
+           AND m.scheduled_at <= NOW() + INTERVAL '15 minutes'
+           AND m.scheduled_at >= NOW() - INTERVAL '2 hours'
+         )
+    `);
 
-    for (const match of simulatedCandidates) {
-      const startsWithin15Min = match.scheduledAt.getTime() - now <= fifteenMinutesMs;
+    for (const match of candidates) {
+      const scheduledTime =
+        match.scheduledAt instanceof Date
+          ? match.scheduledAt.getTime()
+          : new Date(match.scheduledAt).getTime();
+      const startsWithin15Min = scheduledTime - now <= fifteenMinutesMs;
       const isEligible =
         match.status === 'live' ||
         ((match.status === 'upcoming' || match.status === 'scheduled') && startsWithin15Min);
@@ -155,17 +148,12 @@ export async function runLiveWatchdogOnce(
         continue;
       }
 
-      // Garante que o MappingService conheça o vínculo Cito -> UUID canônico em dev.
-      try {
-        await mappingService.linkProviderId({
-          provider: 'cito',
-          entityType: 'match',
-          externalId: match.externalCitoId,
-          entityId: match.id,
-        });
-      } catch {
-        // Ignorado caso o Postgres não esteja rodando localmente (o CitoAdapter possui fallback).
-      }
+      await mappingService.linkProviderId({
+        provider: 'cito',
+        entityType: 'match',
+        externalId: match.externalCitoId,
+        entityId: match.id,
+      });
 
       citoAdapter.connectToLiveMatch(match.externalCitoId);
       activeCitoMatches.add(match.id);
