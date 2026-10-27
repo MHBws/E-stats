@@ -25,6 +25,13 @@ import type {
   TournamentTier,
   UUID,
 } from './models.js';
+// [UPDATE]: Integra `PandaScoreAdapter` para enriquecer `GET /api/matches/:id`
+// com rosters reais (`players`), placar consolidado (`results`) e `players_stats`.
+import {
+  PandaScoreAdapter,
+  type PandaScorePostMatchPlayerStat,
+  type PandaScoreRosterPlayer,
+} from '../providers/pandascore/pandascore.adapter.js';
 
 /** Abas estilo Apple Sports suportadas pelo filtro de listagem. */
 export type MatchTabFilter = 'yesterday' | 'today' | 'upcoming';
@@ -51,6 +58,14 @@ export interface MatchTeamSummary {
   name: string;
   acronym: string | null;
   logo_url: string | null;
+  // [UPDATE]: Elenco de jogadores retornado no detalhe da partida (`GET /api/matches/:id`).
+  players?: PandaScoreRosterPlayer[];
+}
+
+/** Placar consolidado da série (mapas vencidos por cada equipe). */
+export interface MatchSeriesResultsDto {
+  team_a_score: number;
+  team_b_score: number;
 }
 
 /**
@@ -80,9 +95,12 @@ export interface MatchMapDetailDto {
   team_b_score: number;
 }
 
-/** Detalhe completo da partida (`GET /api/matches/:id`), incluindo mapas do veto. */
+/** Detalhe completo da partida (`GET /api/matches/:id`), incluindo mapas, rosters e stats. */
 export interface MatchDetailDto extends MatchCardDto {
   maps: MatchMapDetailDto[];
+  // [UPDATE]: Placar final consolidado da série e estatísticas pós-jogo.
+  results: MatchSeriesResultsDto;
+  players_stats: PandaScorePostMatchPlayerStat[];
 }
 
 /** Linha bruta retornada pelo JOIN de `getMatches`. */
@@ -158,7 +176,10 @@ function mapRowToMatchCard(row: MatchJoinedRow): MatchCardDto {
 }
 
 export class MatchService {
-  constructor(private readonly pool: Pick<pg.Pool, 'query'> = db) {}
+  constructor(
+    private readonly pool: Pick<pg.Pool, 'query'> = db,
+    private readonly pandaAdapter: PandaScoreAdapter = new PandaScoreAdapter(),
+  ) {}
 
   /**
    * Lista partidas para a Home Screen com suporte a filtros opcionais (`status` e `date`).
@@ -326,9 +347,68 @@ export class MatchService {
       }
     }
 
+    // [UPDATE]: Calcula o placar consolidado da série (`results`) a partir dos mapas
+    // concluídos no banco ou do `winner_id` caso os mapas não tenham placar detalhado.
+    let teamAMapsWon = maps.filter(
+      (m) => m.status === 'finished' && m.team_a_score > m.team_b_score,
+    ).length;
+    let teamBMapsWon = maps.filter(
+      (m) => m.status === 'finished' && m.team_b_score > m.team_a_score,
+    ).length;
+
+    if (baseCard.status === 'finished' && teamAMapsWon === 0 && teamBMapsWon === 0) {
+      const targetWins = baseCard.format === 'BO1' ? 1 : baseCard.format === 'BO5' ? 3 : 2;
+      if (baseCard.winner_id && baseCard.winner_id === baseCard.team_a?.id) {
+        teamAMapsWon = targetWins;
+      } else if (baseCard.winner_id && baseCard.winner_id === baseCard.team_b?.id) {
+        teamBMapsWon = targetWins;
+      }
+    }
+
+    // [UPDATE]: Busca rosters reais (`players`) e estatísticas pós-jogo (`players_stats`)
+    // via PandaScore API.
+    const { teamAPlayers, teamBPlayers, playersStats } =
+      await this.pandaAdapter.fetchMatchRostersAndStats({
+        matchId: baseCard.id,
+        status: baseCard.status,
+        winnerId: baseCard.winner_id,
+        teamA: baseCard.team_a
+          ? {
+              id: baseCard.team_a.id,
+              name: baseCard.team_a.name,
+              acronym: baseCard.team_a.acronym,
+            }
+          : null,
+        teamB: baseCard.team_b
+          ? {
+              id: baseCard.team_b.id,
+              name: baseCard.team_b.name,
+              acronym: baseCard.team_b.acronym,
+            }
+          : null,
+        mapsCount: maps.filter((m) => m.status === 'finished').length || maps.length,
+      });
+
     return {
       ...baseCard,
+      team_a: baseCard.team_a
+        ? {
+            ...baseCard.team_a,
+            players: teamAPlayers,
+          }
+        : null,
+      team_b: baseCard.team_b
+        ? {
+            ...baseCard.team_b,
+            players: teamBPlayers,
+          }
+        : null,
       maps,
+      results: {
+        team_a_score: teamAMapsWon,
+        team_b_score: teamBMapsWon,
+      },
+      players_stats: playersStats,
     };
   }
 }

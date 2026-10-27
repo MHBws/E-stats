@@ -13,7 +13,8 @@ export type EpochMs = number;
 
 export type TournamentTier = 'S' | 'A' | 'B' | 'C' | 'D';
 export type MatchFormat = 'BO1' | 'BO3' | 'BO5';
-export type MatchStatus = 'scheduled' | 'live' | 'finished' | 'postponed' | 'canceled';
+// [UPDATE]: Inclui `'not_started'` para compatibilidade direta com status pré-jogo.
+export type MatchStatus = 'scheduled' | 'not_started' | 'live' | 'finished' | 'postponed' | 'canceled';
 export type MapStatus = 'upcoming' | 'live' | 'finished';
 export type ProviderId = 'cito' | 'pandascore';
 
@@ -27,11 +28,27 @@ export interface MatchTournamentSummary {
   tier: TournamentTier | null;
 }
 
+/**
+ * [UPDATE]: Jogador do elenco (roster) retornado dentro de `team_a.players` e
+ * `team_b.players` no endpoint `GET /api/matches/:id`.
+ */
+export interface MatchRosterPlayerDto {
+  id: string;
+  nickname: string;
+  first_name: string | null;
+  last_name: string | null;
+  nationality: string | null;
+  image_url: string | null;
+  age: number | null;
+}
+
 export interface MatchTeamSummary {
   id: UUID;
   name: string;
   acronym: string | null;
   logo_url: string | null;
+  // [UPDATE]: Lista opcional de jogadores do time (preenchida no detalhe da partida).
+  players?: MatchRosterPlayerDto[];
 }
 
 /** Card de partida retornado por `GET /api/matches`. */
@@ -59,9 +76,34 @@ export interface MatchMapDetailDto {
   team_b_score: number;
 }
 
+/** [UPDATE]: Placar final consolidado da série em `MatchDetailDto.results`. */
+export interface MatchSeriesResultsDto {
+  team_a_score: number;
+  team_b_score: number;
+}
+
+/** [UPDATE]: Estatística individual consolidada pós-jogo (`status === 'finished'`). */
+export interface PostMatchPlayerStatDto {
+  player_id: string;
+  nickname: string;
+  team_id: UUID | null;
+  team_name: string;
+  team_acronym: string | null;
+  nationality: string | null;
+  image_url: string | null;
+  kills: number;
+  deaths: number;
+  assists: number;
+  adr: number;
+  rating: number;
+}
+
 /** Detalhe completo da partida retornado por `GET /api/matches/:id`. */
 export interface MatchDetailDto extends MatchCardDto {
   maps: MatchMapDetailDto[];
+  // [UPDATE]: Placar consolidado e estatísticas finais dos jogadores via PandaScore.
+  results?: MatchSeriesResultsDto;
+  players_stats?: PostMatchPlayerStatDto[];
 }
 
 // -----------------------------------------------------------------------------

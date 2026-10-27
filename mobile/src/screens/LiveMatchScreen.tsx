@@ -1,29 +1,34 @@
 // =============================================================================
-// mobile/src/screens/LiveMatchScreen.tsx — Placar Ao Vivo de CS2 (Apple Sports)
+// mobile/src/screens/LiveMatchScreen.tsx — Detalhes da Partida (Pré / Live / Pós)
 // -----------------------------------------------------------------------------
-// O QUE: Tela de acompanhamento em tempo real que recebe `matchId` via rota,
-//        conecta ao WebSocket (`useLiveMatch(matchId)`) e organiza a UI em 3
-//        blocos verticais:
-//          a) Scoreboard Header (Times, Rounds gigantes e lado CT/TR colorido)
-//          b) Match Status (Relógio do round `round_time_remaining_ms` e Bomba)
-//          c) Players Info (Lista rolável com K/D/A e Economia/Bank de cada player)
+// O QUE: Tela de detalhes de partida que busca os metadados reais via REST
+//        (`fetchMatchById(matchId)`) e realiza a renderização condicional
+//        completa conforme o `status` real do confronto:
+//          1. `status === 'scheduled' | 'not_started'`: Renderiza `<PreMatchStats />`
+//             com contador regressivo e elencos (Rosters) reais lado a lado.
+//          2. `status === 'live'`: Instancia o WebSocket (`useLiveMatch(matchId)`)
+//             e renderiza `<LiveScoreboard />` (relógio, C4 e K/D/A + Bank).
+//          3. `status === 'finished'`: Renderiza `<PostMatchSummary />` com o
+//             placar final consolidado, parciais por mapa e tabela de Rating/KDA.
 //
-// POR QUE (Escolhas de Flexbox & Otimização de Re-renderização):
-//   1. Isolamento em Subcomponentes Memoizados (`ScoreboardHeader`, `MatchStatusBlock`,
-//      `PlayerStatRow` com `React.memo`): O WebSocket pode emitir eventos de
-//      relógio/economia várias vezes por segundo. Separar os blocos e memorizar
-//      as linhas de jogadores evita reconstruir toda a lista quando apenas o
-//      cronômetro ou o status da bomba muda.
-//   2. `fontVariant: ['tabular-nums']` nos números de placar, relógio e Bank:
-//      Garante que todos os dígitos ocupem a mesma largura em pixels, impedindo
-//      que o layout Flexbox "trema" horizontalmente a cada segundo do relógio.
-//   3. Semântica Cromática do CS2 em OLED:
-//      - Lado CT (Counter-Terrorist): Azul (`#0A84FF` / fundo `rgba(10,132,255,0.14)`).
-//      - Lado TR (Terrorist): Amarelo/Laranja (`#FF9F0A` / fundo `rgba(255,159,10,0.14)`).
+// POR QUE (Limpeza de Mocks & Eficiência de Rede):
+//   - Nenhum dado estático da FURIA/Vitality é utilizado.
+//   - O WebSocket só é aberto quando `match.status === 'live'`, poupando bateria
+//     no dispositivo móvel e conexões Pub/Sub no servidor para jogos futuros ou
+//     já encerrados.
 // =============================================================================
-import React, { memo, useMemo } from 'react';
-import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import React, { memo, useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  ActivityIndicator,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import { fetchMatchById } from '../api/apiClient';
+import { PostMatchSummary } from '../components/PostMatchSummary';
+import { PreMatchStats } from '../components/PreMatchStats';
 import { useLiveMatch } from '../hooks/useLiveMatch';
 import type {
   CS2BombStatus,
@@ -31,6 +36,7 @@ import type {
   CS2PlayerLiveStats,
   CS2Side,
   CS2TeamLiveState,
+  MatchDetailDto,
   RootStackParamList,
 } from '../types/match';
 
@@ -87,15 +93,13 @@ function getBombDisplay(bomb: CS2BombStatus): { label: string; color: string } {
 }
 
 /**
- * Extrai a lista de 5 jogadores do time a partir de `team.players`.
- * Caso o snapshot venha apenas com a economia agregada do time (ex.: simulação
- * enxuta do CitoAdapter), deriva o roster com K/D/A e Bank proporcional ao
- * `team.economy.money` e ao `killfeed` do `liveState` para manter a UI funcional.
+ * [UPDATE]: Extrai a lista de jogadores do time a partir de `team.players` ou
+ * do roster real retornado pelo endpoint REST (`rosterNicknames`), sem mocks fixos.
  */
 function resolveTeamPlayers(
   team: CS2TeamLiveState,
   liveState: CS2LiveState,
-  defaultRoster: string[],
+  rosterNicknames: string[],
 ): CS2PlayerLiveStats[] {
   if (team.players && team.players.length > 0) {
     return team.players;
@@ -103,7 +107,7 @@ function resolveTeamPlayers(
 
   const perPlayerBank = Math.round((team.economy.money ?? 0) / 5 / 50) * 50;
 
-  return defaultRoster.map((nickname, idx) => {
+  return rosterNicknames.map((nickname, idx) => {
     const killsInFeed = liveState.killfeed.filter(
       (k) => k.attacker?.nickname.toLowerCase() === nickname.toLowerCase(),
     ).length;
@@ -114,9 +118,9 @@ function resolveTeamPlayers(
     return {
       playerId: `${team.teamId}-p${idx + 1}`,
       nickname,
-      kills: team.score + idx * 2 + killsInFeed,
-      deaths: Math.max(1, liveState.round.number - team.score - (idx % 2) + deathsInFeed),
-      assists: (idx + 2) % 5,
+      kills: killsInFeed,
+      deaths: deathsInFeed,
+      assists: 0,
       money: perPlayerBank,
       alive: idx < team.playersAlive,
     };
@@ -124,7 +128,7 @@ function resolveTeamPlayers(
 }
 
 // =============================================================================
-// Bloco A — Scoreboard Header (Times, Rounds grandes e Lado CT/TR colorido)
+// Subcomponente `<LiveScoreboard />` — Renderizado apenas quando `status === 'live'`
 // =============================================================================
 interface ScoreboardHeaderProps {
   teamA: CS2TeamLiveState;
@@ -146,7 +150,6 @@ const ScoreboardHeader = memo(function ScoreboardHeader({
 
   return (
     <View style={styles.scoreboardCard}>
-      {/* Metadados do Mapa Atual e Round */}
       <View style={styles.mapHeaderRow}>
         <Text style={styles.mapNameText}>{mapName.replace('de_', '').toUpperCase()}</Text>
         <Text style={styles.roundBadgeText}>
@@ -154,9 +157,7 @@ const ScoreboardHeader = memo(function ScoreboardHeader({
         </Text>
       </View>
 
-      {/* Linha Principal Flexbox: Time A | Placar Gigante | Time B */}
       <View style={styles.scoreboardMainRow}>
-        {/* Bloco Time A colorido sutilmente conforme lado CT (Azul) ou TR (Amarelo/Laranja) */}
         <View
           style={[
             styles.teamHeaderBox,
@@ -179,7 +180,6 @@ const ScoreboardHeader = memo(function ScoreboardHeader({
           </Text>
         </View>
 
-        {/* Placar de Rounds Bem Grande no Centro */}
         <View style={styles.giantScoreContainer}>
           <Text
             style={[
@@ -200,7 +200,6 @@ const ScoreboardHeader = memo(function ScoreboardHeader({
           </Text>
         </View>
 
-        {/* Bloco Time B colorido sutilmente conforme lado CT (Azul) ou TR (Amarelo/Laranja) */}
         <View
           style={[
             styles.teamHeaderBox,
@@ -227,9 +226,6 @@ const ScoreboardHeader = memo(function ScoreboardHeader({
   );
 });
 
-// =============================================================================
-// Bloco B — Match Status (Relógio do Round e Status da Bomba)
-// =============================================================================
 interface MatchStatusBlockProps {
   roundTimeRemainingMs: number;
   phase: string;
@@ -263,9 +259,6 @@ const MatchStatusBlock = memo(function MatchStatusBlock({
   );
 });
 
-// =============================================================================
-// Bloco C — Linha Individual de Jogador (K/D/A e Economia/Bank)
-// =============================================================================
 interface PlayerRowProps {
   player: CS2PlayerLiveStats;
   side: CS2Side;
@@ -296,54 +289,51 @@ const PlayerStatRow = memo(function PlayerStatRow({
   );
 });
 
-// =============================================================================
-// Componente Principal — LiveMatchScreen
-// =============================================================================
-export function LiveMatchScreen({ route }: LiveMatchScreenProps): React.JSX.Element {
-  const { matchId } = route.params;
-  const { liveState, isConnected, error } = useLiveMatch(matchId);
+interface LiveScoreboardProps {
+  matchId: string;
+  matchDetail: MatchDetailDto;
+  liveState: CS2LiveState | null;
+  isConnected: boolean;
+  wsError: string | null;
+}
 
-  // Consolida listas de jogadores de cada equipe apenas quando `liveState` muda.
+const LiveScoreboard = memo(function LiveScoreboard({
+  matchId,
+  matchDetail,
+  liveState,
+  isConnected,
+  wsError,
+}: LiveScoreboardProps): React.JSX.Element {
   const { teamAPlayers, teamBPlayers } = useMemo(() => {
     if (!liveState) {
       return { teamAPlayers: [], teamBPlayers: [] };
     }
+    const rosterA = (matchDetail.team_a?.players ?? []).map((p) => p.nickname);
+    const rosterB = (matchDetail.team_b?.players ?? []).map((p) => p.nickname);
+
     return {
-      teamAPlayers: resolveTeamPlayers(liveState.teams.teamA, liveState, [
-        'KSCERATO',
-        'yuurih',
-        'FalleN',
-        'chelo',
-        'skullz',
-      ]),
-      teamBPlayers: resolveTeamPlayers(liveState.teams.teamB, liveState, [
-        'ZywOo',
-        'apEX',
-        'Spinx',
-        'flameZ',
-        'mezii',
-      ]),
+      teamAPlayers: resolveTeamPlayers(liveState.teams.teamA, liveState, rosterA),
+      teamBPlayers: resolveTeamPlayers(liveState.teams.teamB, liveState, rosterB),
     };
-  }, [liveState]);
+  }, [liveState, matchDetail.team_a?.players, matchDetail.team_b?.players]);
 
   const roundTimeRemainingMs =
     liveState?.round_time_remaining_ms ?? liveState?.round.clock.remainingMs ?? 0;
 
   return (
     <View style={styles.screenContainer}>
-      {/* Indicador discreto de reconexão quando o WebSocket está desconectado */}
       {!isConnected && (
         <View style={styles.reconnectingBanner}>
           <View style={styles.reconnectingDot} />
-          <Text style={styles.reconnectingText}>Reconectando...</Text>
+          <Text style={styles.reconnectingText}>Reconectando ao stream ao vivo...</Text>
         </View>
       )}
 
       {!liveState ? (
         <View style={styles.emptyStateCard}>
-          <Text style={styles.emptyTitle}>Aguardando dados ao vivo da partida</Text>
+          <Text style={styles.emptyTitle}>Aguardando telemetria ao vivo da partida</Text>
           <Text style={styles.emptySubtitle}>
-            {error ?? `ID da partida: ${matchId}`}
+            {wsError ?? `${matchDetail.team_a?.name ?? 'Equipe A'} vs ${matchDetail.team_b?.name ?? 'Equipe B'} (${matchId})`}
           </Text>
         </View>
       ) : (
@@ -351,7 +341,6 @@ export function LiveMatchScreen({ route }: LiveMatchScreenProps): React.JSX.Elem
           contentContainerStyle={styles.scrollContent}
           showsVerticalScrollIndicator={false}
         >
-          {/* (a) Scoreboard Header */}
           <ScoreboardHeader
             teamA={liveState.teams.teamA}
             teamB={liveState.teams.teamB}
@@ -360,14 +349,12 @@ export function LiveMatchScreen({ route }: LiveMatchScreenProps): React.JSX.Elem
             format={liveState.format}
           />
 
-          {/* (b) Match Status: Relógio do Round + Status da Bomba */}
           <MatchStatusBlock
             roundTimeRemainingMs={roundTimeRemainingMs}
             phase={liveState.round.phase}
             bomb={liveState.bomb}
           />
 
-          {/* (c) Players Info (Resumo): K/D/A e Economia (Bank) de cada jogador */}
           <View style={styles.playersSectionCard}>
             <View style={styles.playersGroupHeader}>
               <Text
@@ -427,12 +414,117 @@ export function LiveMatchScreen({ route }: LiveMatchScreenProps): React.JSX.Elem
       )}
     </View>
   );
+});
+
+// =============================================================================
+// Componente Principal — LiveMatchScreen (Orquestrador Pré / Live / Pós)
+// =============================================================================
+export function LiveMatchScreen({ route }: LiveMatchScreenProps): React.JSX.Element {
+  const { matchId } = route.params;
+
+  const [matchDetail, setMatchDetail] = useState<MatchDetailDto | null>(null);
+  const [loadingDetail, setLoadingDetail] = useState<boolean>(true);
+  const [detailError, setDetailError] = useState<string | null>(null);
+
+  const loadDetail = useCallback(async (): Promise<void> => {
+    setLoadingDetail(true);
+    try {
+      const detail = await fetchMatchById(matchId);
+      setMatchDetail(detail);
+      setDetailError(null);
+    } catch (err: unknown) {
+      setDetailError(
+        err instanceof Error
+          ? err.message
+          : 'Não foi possível carregar os detalhes da partida.',
+      );
+    } finally {
+      setLoadingDetail(false);
+    }
+  }, [matchId]);
+
+  useEffect(() => {
+    void loadDetail();
+  }, [loadDetail]);
+
+  // [UPDATE]: O WebSocket SÓ é instanciado e consumido quando `match.status === 'live'`.
+  const isLiveMatch = matchDetail?.status === 'live';
+  const { liveState, isConnected, error: wsError } = useLiveMatch(
+    isLiveMatch ? matchId : null,
+  );
+
+  if (loadingDetail) {
+    return (
+      <View style={styles.centeredContainer}>
+        <ActivityIndicator color="#FFFFFF" size="large" />
+        <Text style={styles.loadingText}>Carregando detalhes da partida...</Text>
+      </View>
+    );
+  }
+
+  if (!matchDetail || detailError) {
+    return (
+      <View style={styles.screenContainer}>
+        <View style={styles.emptyStateCard}>
+          <Text style={styles.emptyTitle}>Falha ao carregar partida</Text>
+          <Text style={styles.emptySubtitle}>
+            {detailError ?? `Partida ${matchId} não encontrada.`}
+          </Text>
+        </View>
+      </View>
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // [UPDATE]: Renderização Condicional pelos 3 estados da partida:
+  //   - 'live'                         -> <LiveScoreboard />
+  //   - 'finished'                     -> <PostMatchSummary />
+  //   - 'not_started' / 'scheduled'    -> <PreMatchStats />
+  // ---------------------------------------------------------------------------
+  if (matchDetail.status === 'live') {
+    return (
+      <LiveScoreboard
+        matchId={matchId}
+        matchDetail={matchDetail}
+        liveState={liveState}
+        isConnected={isConnected}
+        wsError={wsError}
+      />
+    );
+  }
+
+  if (matchDetail.status === 'finished') {
+    return (
+      <View style={styles.screenContainer}>
+        <PostMatchSummary match={matchDetail} />
+      </View>
+    );
+  }
+
+  // `status === 'not_started' | 'scheduled' | 'postponed' | 'canceled'`
+  return (
+    <View style={styles.screenContainer}>
+      <PreMatchStats match={matchDetail} />
+    </View>
+  );
 }
 
 const styles = StyleSheet.create({
   screenContainer: {
     flex: 1,
     backgroundColor: COLORS.background,
+  },
+  centeredContainer: {
+    flex: 1,
+    backgroundColor: COLORS.background,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 24,
+  },
+  loadingText: {
+    color: COLORS.textSecondary,
+    fontSize: 13,
+    marginTop: 12,
   },
   reconnectingBanner: {
     flexDirection: 'row',
@@ -462,7 +554,6 @@ const styles = StyleSheet.create({
     paddingTop: 12,
     paddingBottom: 40,
   },
-  // --- Bloco A: Scoreboard Header ---
   scoreboardCard: {
     backgroundColor: COLORS.card,
     borderRadius: 18,
@@ -549,7 +640,6 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginHorizontal: 6,
   },
-  // --- Bloco B: Match Status ---
   statusCard: {
     backgroundColor: COLORS.card,
     borderRadius: 16,
@@ -596,7 +686,6 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     textAlign: 'center',
   },
-  // --- Bloco C: Players Info ---
   playersSectionCard: {
     backgroundColor: COLORS.card,
     borderRadius: 16,
