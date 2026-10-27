@@ -40,5 +40,6 @@
     "sourceMap": true
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist"]
+  // [UPDATE]: Módulo 7 — Exclui `mobile/` (possui seu próprio tsconfig do Expo).
+  "exclude": ["node_modules", "dist", "mobile"]
 }

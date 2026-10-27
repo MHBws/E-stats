@@ -4,6 +4,10 @@
 
 # Dependências: reinstaladas via `npm ci` (pesadas e dependentes de plataforma).
 node_modules/
+# [UPDATE]: Módulo 7 — Ignora artefatos de cache/build do Expo no app mobile.
+.expo/
+mobile/.expo/
+mobile/dist/
 
 # Saída de build do TypeScript (gerada por `npm run build`).
 dist/

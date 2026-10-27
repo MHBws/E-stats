@@ -1,0 +1,17 @@
+{
+  "expo": {
+    "name": "E-stats",
+    "slug": "e-stats",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#000000",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "app.estats.mobile"
+    },
+    "android": {
+      "package": "app.estats.mobile"
+    }
+  }
+}
