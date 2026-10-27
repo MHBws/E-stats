@@ -22,6 +22,13 @@ import { matchRoutes } from './api/match.routes.js';
 import { MappingService } from './core/mapping.service.js';
 import { PandaScoreAdapter } from './providers/pandascore/pandascore.adapter.js';
 import { CitoAdapter } from './providers/cito/cito.adapter.js';
+// [UPDATE]: Módulo 6 — Importa os agendadores de Cron Jobs (PandaScore Sync 6h
+// e Live Watchdog 1min) e a rotina de parada segura (`stopAllJobs`).
+import {
+  scheduleLiveWatchdog,
+  schedulePandaScoreSync,
+  stopAllJobs,
+} from './workers/cron.manager.js';
 
 const app = Fastify({
   logger: { level: env.logLevel },
@@ -56,6 +63,12 @@ async function bootstrap(): Promise<void> {
     '[providers] Adapters PandaScore e Cito inicializados com MappingService',
   );
 
+  // [UPDATE]: Módulo 6 — Inicia os workers autônomos (sync de 6h + watchdog de 1m)
+  // após a infraestrutura de dados e cache estar pronta.
+  schedulePandaScoreSync(pandaScoreAdapter);
+  scheduleLiveWatchdog(citoAdapter);
+  app.log.info('[workers] Cron jobs iniciados (PandaScore 6h sync + Live Watchdog 1m)');
+
   await app.listen({ host: env.host, port: env.port });
 }
 
@@ -63,6 +76,8 @@ async function bootstrap(): Promise<void> {
 async function shutdown(signal: string): Promise<void> {
   app.log.info(`[server] Sinal ${signal} recebido, encerrando...`);
   try {
+    // [UPDATE]: Módulo 6 — Para todos os cron jobs e desconecta streams ativos da Cito.
+    await stopAllJobs(citoAdapter);
     // [UPDATE]: Módulo 3 — Encerra streams ativos da Cito antes de fechar o Redis.
     citoAdapter.disconnectAll();
     await app.close(); // para de aceitar conexões e fecha os WebSockets
