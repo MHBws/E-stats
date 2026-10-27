@@ -104,15 +104,41 @@ export class PandaScoreAdapter {
   }
 
   /**
-   * [UPDATE]: Faz a requisição HTTP real para a API da PandaScore buscando
-   * partidas ao vivo (`running`) e futuras (`not_started`) de CS2.
+   * [UPDATE]: Faz requisições HTTP reais para a API da PandaScore buscando:
+   *   1. Partidas ao vivo (`running`) e futuras (`not_started`).
+   *   2. Partidas concluídas (`finished`) nos últimos 4 dias (janela enxuta
+   *      para alimentar a aba "Ontem" sem sobrecarregar o PostgreSQL).
    */
   private async fetchRawMatchesFromApi(): Promise<PandaScoreRawMatch[]> {
     const token = this.assertValidApiKey();
 
-    // Busca partidas em andamento (`running`) e próximas (`not_started`) ordenadas por horário.
-    const url = `${this.baseUrl}/matches?filter[status]=running,not_started&sort=status,begin_at&per_page=25`;
+    const now = new Date();
+    const fourDaysAgo = new Date(now.getTime() - 4 * 24 * 60 * 60 * 1_000);
+    const rangeStartIso = fourDaysAgo.toISOString();
+    const rangeEndIso = now.toISOString();
 
+    // 1) Jogos em andamento (`running`) e próximos (`not_started`).
+    const activeAndUpcomingUrl = `${this.baseUrl}/matches?filter[status]=running,not_started&sort=status,begin_at&per_page=35`;
+
+    // 2) Jogos finalizados (`finished`) restritos aos últimos 4 dias (D-4 até agora).
+    const recentFinishedUrl = `${this.baseUrl}/matches?filter[status]=finished&range[begin_at]=${encodeURIComponent(rangeStartIso)},${encodeURIComponent(rangeEndIso)}&sort=-begin_at&per_page=25`;
+
+    const [activeAndUpcoming, recentFinished] = await Promise.all([
+      this.fetchMatchEndpoint(activeAndUpcomingUrl, token),
+      this.fetchMatchEndpoint(recentFinishedUrl, token),
+    ]);
+
+    // Deduplica por `id` caso uma partida tenha mudado de status entre as duas chamadas.
+    const mergedById = new Map<number, PandaScoreRawMatch>();
+    for (const match of [...activeAndUpcoming, ...recentFinished]) {
+      mergedById.set(match.id, match);
+    }
+
+    return Array.from(mergedById.values());
+  }
+
+  /** Executa o GET autenticado em um endpoint de listagem de partidas da PandaScore. */
+  private async fetchMatchEndpoint(url: string, token: string): Promise<PandaScoreRawMatch[]> {
     const response = await fetch(url, {
       method: 'GET',
       headers: {

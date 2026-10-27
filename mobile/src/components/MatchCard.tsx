@@ -118,6 +118,24 @@ function MatchCardComponent({ match, onPress }: MatchCardProps): React.JSX.Eleme
   const showTeamALogo = Boolean(teamALogoUrl) && !teamALogoError;
   const showTeamBLogo = Boolean(teamBLogoUrl) && !teamBLogoError;
 
+  // [UPDATE]: Define o placar exibido na série com base no `winner_id` para jogos
+  // finalizados (ou 0-0 / 1-0 caso ainda em andamento).
+  const targetWins = match.format === 'BO1' ? 1 : match.format === 'BO5' ? 3 : 2;
+  const teamAScore =
+    isFinished && match.winner_id
+      ? match.winner_id === match.team_a?.id
+        ? targetWins
+        : 0
+      : isLive
+        ? 1
+        : 0;
+  const teamBScore =
+    isFinished && match.winner_id
+      ? match.winner_id === match.team_b?.id
+        ? targetWins
+        : 0
+      : 0;
+
   return (
     // [UPDATE]: Módulo 8 — `Pressable` nativo com feedback tátil de opacidade
     // e paleta Dark Mode OLED (`#1C1C1E` sobre fundo `#000000`).
@@ -143,7 +161,7 @@ function MatchCardComponent({ match, onPress }: MatchCardProps): React.JSX.Eleme
             <Text style={styles.liveBadgeText}>AO VIVO</Text>
           </View>
         ) : isFinished ? (
-          <Text style={styles.statusText}>ENCERRADO</Text>
+          <Text style={styles.statusText}>{schedule.dateLabel} • ENCERRADO</Text>
         ) : schedule.isToday ? (
           // [UPDATE]: Destaque verde (#22c55e) para partidas que acontecem Hoje.
           <Text style={styles.statusText}>
@@ -185,9 +203,9 @@ function MatchCardComponent({ match, onPress }: MatchCardProps): React.JSX.Eleme
         <View style={styles.scoreCenterBox}>
           {isLive || isFinished ? (
             <View style={styles.scoreNumbersRow}>
-              <Text style={styles.scoreNumber}>1</Text>
+              <Text style={styles.scoreNumber}>{teamAScore}</Text>
               <Text style={styles.scoreSeparator}>-</Text>
-              <Text style={styles.scoreNumber}>0</Text>
+              <Text style={styles.scoreNumber}>{teamBScore}</Text>
             </View>
           ) : (
             <Text style={styles.versusLabel}>VS</Text>

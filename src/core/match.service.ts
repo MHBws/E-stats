@@ -26,11 +26,16 @@ import type {
   UUID,
 } from './models.js';
 
+/** Abas estilo Apple Sports suportadas pelo filtro de listagem. */
+export type MatchTabFilter = 'yesterday' | 'today' | 'upcoming';
+
 /** Filtros aceitos pela listagem da Home Screen (`GET /api/matches`). */
 export interface MatchListFilters {
   status?: string;
   /** Data no formato ISO `YYYY-MM-DD` (UTC). */
   date?: string;
+  // [UPDATE]: Suporte opcional ao filtro por aba (`?tab=yesterday|today|upcoming`).
+  tab?: MatchTabFilter;
 }
 
 /** Resumo do campeonato embutido no card da partida. */
@@ -182,6 +187,29 @@ export class MatchService {
       const idx = params.length;
       conditions.push(
         `m.scheduled_at >= ($${idx}::date AT TIME ZONE 'UTC') AND m.scheduled_at < (($${idx}::date + INTERVAL '1 day') AT TIME ZONE 'UTC')`,
+      );
+    } else if (filters?.tab === 'yesterday') {
+      // [UPDATE]: Aba "Ontem" via querystring: partidas finalizadas recentes (últimos 4 dias)
+      // ou agendadas estritamente antes do dia atual.
+      conditions.push(
+        `(m.status = 'finished' OR m.scheduled_at < DATE_TRUNC('day', NOW())) AND m.scheduled_at >= NOW() - INTERVAL '4 days'`,
+      );
+    } else if (filters?.tab === 'today') {
+      // [UPDATE]: Aba "Hoje" via querystring: partidas ao vivo ou agendadas para a data atual.
+      conditions.push(
+        `(m.status = 'live' OR (m.scheduled_at >= DATE_TRUNC('day', NOW()) AND m.scheduled_at < DATE_TRUNC('day', NOW()) + INTERVAL '1 day'))`,
+      );
+    } else if (filters?.tab === 'upcoming') {
+      // [UPDATE]: Aba "Próximos" via querystring: partidas agendadas após o dia de hoje.
+      conditions.push(
+        `m.scheduled_at >= DATE_TRUNC('day', NOW()) + INTERVAL '1 day' AND m.status NOT IN ('live', 'finished')`,
+      );
+    } else if (!filters?.status) {
+      // [UPDATE]: Opção A (Padrão para UX instantânea no Mobile): retorna todas as
+      // partidas na janela de D-4 até D+7 (além de qualquer jogo `live`), permitindo
+      // que o app alterne entre "Ontem", "Hoje" e "Próximos" em memória com latência zero.
+      conditions.push(
+        `(m.status = 'live' OR (m.scheduled_at >= NOW() - INTERVAL '4 days' AND m.scheduled_at <= NOW() + INTERVAL '7 days'))`,
       );
     }
 

@@ -12,7 +12,7 @@
 //          simples no cliente mobile.
 // =============================================================================
 import type { FastifyInstance } from 'fastify';
-import { MatchService, matchService } from '../core/match.service.js';
+import { MatchService, type MatchTabFilter, matchService } from '../core/match.service.js';
 // [UPDATE]: Importa os gatilhos de sincronização da PandaScore e do Watchdog Cito
 // para expor a rota manual `GET /api/sync/force`.
 import { runLiveWatchdogOnce, runPandaScoreSyncOnce } from '../workers/cron.manager.js';
@@ -20,6 +20,8 @@ import { runLiveWatchdogOnce, runPandaScoreSyncOnce } from '../workers/cron.mana
 export interface MatchesQuerystring {
   status?: string;
   date?: string;
+  // [UPDATE]: Permite filtrar opcionalmente por aba (`?tab=yesterday|today|upcoming`).
+  tab?: MatchTabFilter;
 }
 
 export interface MatchParams {
@@ -33,16 +35,16 @@ export async function matchRoutes(
   const service = options?.service ?? matchService;
 
   // ---------------------------------------------------------------------------
-  // GET /matches — Lista partidas para a Home Screen (filtros: ?status=&date=)
+  // GET /matches — Lista partidas para a Home Screen (filtros: ?status=&date=&tab=)
   // ---------------------------------------------------------------------------
   app.get<{ Querystring: MatchesQuerystring }>('/matches', async (request, reply) => {
-    const { status, date } = request.query;
+    const { status, date, tab } = request.query;
 
     try {
-      const matches = await service.getMatches({ status, date });
+      const matches = await service.getMatches({ status, date, tab });
       return reply.code(200).send(matches);
     } catch (err) {
-      request.log.error({ err, status, date }, '[api] Erro ao listar partidas em GET /matches');
+      request.log.error({ err, status, date, tab }, '[api] Erro ao listar partidas em GET /matches');
       return reply.code(500).send({
         error: 'Internal Server Error',
         message: 'Falha ao buscar a lista de partidas.',
