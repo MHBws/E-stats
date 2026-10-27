@@ -77,6 +77,11 @@ const LEGACY_MOCK_MATCH_UUID = '00000000-0000-4000-8000-000000000001';
 export class PandaScoreAdapter {
   readonly providerId = 'pandascore' as const;
   private readonly baseUrl = 'https://api.pandascore.co/csgo';
+  /**
+   * [UPDATE]: UUIDs das partidas com status `running` (AO VIVO) no último
+   * `syncMatches()`. Consumido pelo cron.manager para o handoff à Cito Sports.
+   */
+  lastSyncLiveMatchIds: UUID[] = [];
 
   constructor(
     private readonly mapper: MappingService = mappingService,
@@ -154,6 +159,8 @@ export class PandaScoreAdapter {
    */
   async syncMatches(): Promise<Match[]> {
     const rawMatches = await this.fetchRawMatchesFromApi();
+    // [UPDATE]: Reinicia a lista de partidas AO VIVO detectadas neste ciclo.
+    const liveMatchIds: UUID[] = [];
 
     // Remove os 3 registros de mock antigos (se existirem) para que a Home Screen
     // exiba exclusivamente o calendário real vindo da PandaScore.
@@ -250,6 +257,13 @@ export class PandaScoreAdapter {
         entityId: matchId,
       });
 
+      // [UPDATE]: FILTRO DE JOGOS AO VIVO — partidas com status `running` na
+      // PandaScore (mapeado para `live`) são separadas para o handoff à Cito
+      // Sports, que passa a ser a ÚNICA fonte dos dados granulares ao vivo.
+      if (status === 'live') {
+        liveMatchIds.push(matchId);
+      }
+
       // 4. Mapas da série (`games` do payload da PandaScore -> `match_maps`).
       if (Array.isArray(raw.games)) {
         for (const game of raw.games) {
@@ -279,6 +293,14 @@ export class PandaScoreAdapter {
         createdAt: now,
         updatedAt: now,
       });
+    }
+
+    // [UPDATE]: Expõe as partidas ao vivo do último ciclo para o cron.manager.
+    this.lastSyncLiveMatchIds = liveMatchIds;
+    if (liveMatchIds.length > 0) {
+      console.info(
+        `[pandascore] ${liveMatchIds.length} partida(s) AO VIVO detectada(s); encaminhando para a Cito Sports.`,
+      );
     }
 
     return syncedMatches;

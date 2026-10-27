@@ -62,6 +62,15 @@ export const env = Object.freeze({
   },
   // [UPDATE]: Exposição direta de `PANDASCORE_API_KEY` para validação explícita no adapter.
   PANDASCORE_API_KEY: optional('PANDASCORE_API_KEY', ''),
+
+  // [UPDATE]: Configuração do provedor de tempo real Cito Sports (citoapi.com).
+  // POR QUE expor aqui: o adapter valida a chave explicitamente (sem fallback
+  // para dados simulados) e permite ajustar URL/intervalo sem recompilar.
+  CITO_API_KEY: optional('CITO_API_KEY', ''),
+  CITO_API_BASE_URL: optional('CITO_API_BASE_URL', 'https://api.citoapi.com/api/v1'),
+  // Intervalo de polling do endpoint `/cs2/live/{id}/state` (ms). 3s equilibra
+  // latência percebida no app e consumo da franquia de requisições do plano.
+  CITO_POLL_INTERVAL_MS: toInt('CITO_POLL_INTERVAL_MS', optional('CITO_POLL_INTERVAL_MS', '3000')),
 } as const);
 
 export type Env = typeof env;

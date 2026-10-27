@@ -25,26 +25,40 @@
 //     abriria uma NOVA conexão WebSocket/SSE na Cito a cada minuto para a mesma
 //     partida — gerando centenas de conexões duplicadas, estourando rate-limit,
 //     publicando eventos repetidos no Redis Pub/Sub e vazando memória.
+//
+// [UPDATE]: HANDOFF PandaScore -> Cito Sports. Logo após cada sync, as partidas
+//   que a PandaScore retornou como `running` (AO VIVO) são entregues
+//   imediatamente à Cito (`handoffLiveMatchesToCito`), sem esperar o próximo
+//   minuto do watchdog. O watchdog continua como rede de segurança para jogos
+//   que começam entre dois syncs de 6h.
 // =============================================================================
 import cron, { type ScheduledTask } from 'node-cron';
 // [UPDATE]: Consulta real ao PostgreSQL no Watchdog ao vivo.
 import { db } from '../core/database.js';
-import { MappingService, mappingService } from '../core/mapping.service.js';
-import { CitoAdapter } from '../providers/cito/cito.adapter.js';
+import type { MatchFormat, UUID } from '../core/models.js';
+import { MappingService } from '../core/mapping.service.js';
+import { CitoAdapter, type LiveTrackingTarget } from '../providers/cito/cito.adapter.js';
 import { PandaScoreAdapter } from '../providers/pandascore/pandascore.adapter.js';
 
-/** Representação enxuta de uma partida elegível para monitoramento ao vivo. */
-interface WatchdogCandidateMatch {
-  id: string;
-  externalCitoId: string;
-  status: 'upcoming' | 'scheduled' | 'live';
-  scheduledAt: Date;
+/**
+ * [UPDATE]: Linha retornada pelo PostgreSQL com tudo que a Cito precisa para
+ * localizar a partida (nomes/siglas dos times para o pareamento de IDs).
+ */
+interface TrackingTargetRow {
+  id: UUID;
+  format: MatchFormat;
+  teamAId: UUID | null;
+  teamAName: string | null;
+  teamAAcronym: string | null;
+  teamBId: UUID | null;
+  teamBName: string | null;
+  teamBAcronym: string | null;
 }
 
 /**
  * Rastreia os `matchId` (UUIDs canônicos) que JÁ possuem conexão ativa na Cito.
  * Lookup O(1) via `Set.has()` impede que o watchdog de 1 minuto abra múltiplos
- * WebSockets concorrentes para o mesmo jogo.
+ * streams concorrentes para o mesmo jogo.
  */
 export const activeCitoMatches = new Set<string>();
 
@@ -53,35 +67,149 @@ const scheduledTasks: ScheduledTask[] = [];
 
 // Instâncias padrão reutilizadas pelos workers (permitem injeção caso necessário).
 const defaultMapper = new MappingService();
-const defaultPandaScoreAdapter = new PandaScoreAdapter(defaultMapper);
-const defaultCitoAdapter = new CitoAdapter(defaultMapper);
+// [UPDATE]: Instâncias "ativas" — quando o `server.ts` registra seus adapters nos
+// agendadores, a rota manual `/api/sync/force` passa a reutilizar as MESMAS
+// instâncias. POR QUE: sessões de polling da Cito vivem em memória no adapter;
+// duas instâncias diferentes poderiam monitorar o mesmo jogo em duplicidade e o
+// shutdown só encerraria uma delas.
+let activePandaScoreAdapter = new PandaScoreAdapter(defaultMapper);
+let activeCitoAdapter = new CitoAdapter(defaultMapper);
+
+/** Converte a linha do banco no alvo de monitoramento esperado pela Cito. */
+function toTrackingTarget(row: TrackingTargetRow): LiveTrackingTarget {
+  return {
+    matchId: row.id,
+    format: row.format,
+    teamA: { id: row.teamAId, name: row.teamAName, acronym: row.teamAAcronym },
+    teamB: { id: row.teamBId, name: row.teamBName, acronym: row.teamBAcronym },
+  };
+}
+
+/** SELECT base com os times da partida (sem filtro). */
+const TRACKING_TARGET_SELECT = `
+  SELECT
+    m.id,
+    m.format,
+    ta.id      AS "teamAId",
+    ta.name    AS "teamAName",
+    ta.acronym AS "teamAAcronym",
+    tb.id      AS "teamBId",
+    tb.name    AS "teamBName",
+    tb.acronym AS "teamBAcronym"
+  FROM matches m
+  LEFT JOIN teams ta ON ta.id = m.team_a_id
+  LEFT JOIN teams tb ON tb.id = m.team_b_id
+`;
+
+/**
+ * [UPDATE]: Entrega uma lista de partidas à Cito Sports, respeitando o `Set`
+ * anti-duplicidade. Retorna quantas passaram a ser monitoradas agora.
+ */
+async function startTrackingTargets(
+  targets: LiveTrackingTarget[],
+  citoAdapter: CitoAdapter,
+  origin: 'handoff' | 'watchdog',
+): Promise<number> {
+  let started = 0;
+
+  for (const target of targets) {
+    // PRECAUÇÃO CONTRA DUPLICIDADE: pula partidas já monitoradas.
+    if (activeCitoMatches.has(target.matchId) || citoAdapter.isTracking(target.matchId)) continue;
+
+    // Partidas "TBD" (sem os dois times) não podem ser pareadas na Cito.
+    if (!target.teamA.name || !target.teamB.name) continue;
+
+    try {
+      const ok = await citoAdapter.startLiveTracking(target, (endedMatchId) => {
+        // Callback de encerramento: libera a vaga no `Set` quando a Cito
+        // reporta fim de jogo (ou após falhas definitivas), evitando que uma
+        // partida encerrada fique "presa" em memória para sempre.
+        activeCitoMatches.delete(endedMatchId);
+      });
+
+      if (ok) {
+        activeCitoMatches.add(target.matchId);
+        started += 1;
+        console.info(
+          `[cron:${origin}] Cito monitorando ${target.teamA.name} vs ${target.teamB.name} (${target.matchId}); conexões ativas=${activeCitoMatches.size}`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        `[cron:${origin}] Falha ao iniciar Cito para a partida ${target.matchId}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  return started;
+}
+
+/**
+ * [UPDATE]: HANDOFF IMEDIATO — recebe os UUIDs das partidas que a PandaScore
+ * acabou de reportar como AO VIVO e aciona a Cito Sports para cada uma.
+ */
+export async function handoffLiveMatchesToCito(
+  matchIds: UUID[],
+  citoAdapter: CitoAdapter = activeCitoAdapter,
+): Promise<number> {
+  if (matchIds.length === 0) return 0;
+
+  if (!citoAdapter.isConfigured()) {
+    console.error(
+      `[cron:handoff] ${matchIds.length} partida(s) ao vivo não serão monitoradas: CITO_API_KEY ausente ou fake. Configure uma chave real no .env.`,
+    );
+    return 0;
+  }
+
+  const { rows } = await db.query<TrackingTargetRow>(
+    `${TRACKING_TARGET_SELECT} WHERE m.id = ANY($1::uuid[])`,
+    [matchIds],
+  );
+  return startTrackingTargets(rows.map(toTrackingTarget), citoAdapter, 'handoff');
+}
 
 /**
  * Executa uma passagem de sincronização de partidas futuras na PandaScore.
  * Separada do agendamento para facilitar logs e execução imediata/testes.
  */
 export async function runPandaScoreSyncOnce(
-  pandaAdapter: PandaScoreAdapter = defaultPandaScoreAdapter,
+  pandaAdapter: PandaScoreAdapter = activePandaScoreAdapter,
+  citoAdapter: CitoAdapter = activeCitoAdapter,
 ): Promise<number> {
+  let syncedCount = 0;
   try {
     // [UPDATE]: Chama `syncMatches()` para buscar na PandaScore e fazer UPSERT real
     // de torneios, times, partidas, mapas e vínculos no PostgreSQL.
     const syncedMatches = await pandaAdapter.syncMatches();
+    syncedCount = syncedMatches.length;
 
     console.info(
-      `[cron:pandascore] Sincronização concluída: ${syncedMatches.length} partidas persistidas no banco.`,
+      `[cron:pandascore] Sincronização concluída: ${syncedCount} partidas persistidas no banco.`,
     );
-    return syncedMatches.length;
   } catch (err) {
     console.error('[cron:pandascore] Falha ao sincronizar partidas da PandaScore:', err);
     throw err;
   }
+
+  // [UPDATE]: Handoff das partidas AO VIVO para a Cito. Erros aqui NÃO derrubam
+  // o sync do calendário (as partidas já foram salvas com sucesso).
+  try {
+    await handoffLiveMatchesToCito(pandaAdapter.lastSyncLiveMatchIds, citoAdapter);
+  } catch (err) {
+    console.error('[cron:handoff] Falha no handoff de partidas ao vivo para a Cito:', err);
+  }
+
+  return syncedCount;
 }
 
 // Agenda a sincronização automática com a PandaScore a cada 6 horas ('0 */6 * * *').
 export function schedulePandaScoreSync(
-  pandaAdapter: PandaScoreAdapter = defaultPandaScoreAdapter,
+  pandaAdapter: PandaScoreAdapter = activePandaScoreAdapter,
 ): ScheduledTask {
+  // [UPDATE]: Registra a instância como ativa para reuso pela rota manual.
+  activePandaScoreAdapter = pandaAdapter;
+
   const task = cron.schedule(
     '0 */6 * * *',
     async () => {
@@ -103,25 +231,24 @@ export function schedulePandaScoreSync(
  * horário atual.
  */
 export async function runLiveWatchdogOnce(
-  citoAdapter: CitoAdapter = defaultCitoAdapter,
+  citoAdapter: CitoAdapter = activeCitoAdapter,
 ): Promise<void> {
   try {
-    const now = Date.now();
-    const fifteenMinutesMs = 15 * 60 * 1_000;
+    // [UPDATE]: Sem chave válida da Cito não há o que monitorar; registra o
+    // erro UMA vez por ciclo (em vez de uma vez por partida).
+    if (!citoAdapter.isConfigured()) {
+      console.error(
+        '[cron:watchdog] CITO_API_KEY ausente ou fake: monitoramento ao vivo desativado. Configure uma chave real no .env.',
+      );
+      return;
+    }
 
-    // [UPDATE]: Consulta real no banco PostgreSQL buscando partidas `live` ou
-    // prestes a iniciar nos próximos 15 minutos (`scheduled` / `upcoming`).
-    const { rows: candidates } = await db.query<WatchdogCandidateMatch>(`
-      SELECT
-        m.id,
-        COALESCE(pm.external_id, m.id::text) AS "externalCitoId",
-        m.status,
-        m.scheduled_at AS "scheduledAt"
-      FROM matches m
-      LEFT JOIN provider_mappings pm
-        ON pm.entity_id = m.id
-       AND pm.entity_type = 'match'
-       AND pm.provider = 'cito'
+    // [UPDATE]: Busca partidas `live` ou prestes a iniciar (janela de 15 min
+    // antes até 2h depois do horário oficial), já com os nomes dos times para
+    // o pareamento na Cito. Se a Cito ainda não listar o jogo como ao vivo, o
+    // `startLiveTracking` retorna `false` e tentamos de novo no próximo minuto.
+    const { rows } = await db.query<TrackingTargetRow>(`
+      ${TRACKING_TARGET_SELECT}
       WHERE m.status = 'live'
          OR (
            m.status IN ('upcoming', 'scheduled')
@@ -130,38 +257,7 @@ export async function runLiveWatchdogOnce(
          )
     `);
 
-    for (const match of candidates) {
-      const scheduledTime =
-        match.scheduledAt instanceof Date
-          ? match.scheduledAt.getTime()
-          : new Date(match.scheduledAt).getTime();
-      const startsWithin15Min = scheduledTime - now <= fifteenMinutesMs;
-      const isEligible =
-        match.status === 'live' ||
-        ((match.status === 'upcoming' || match.status === 'scheduled') && startsWithin15Min);
-
-      if (!isEligible) continue;
-
-      // PRECAUÇÃO CONTRA DUPLICIDADE: só abre stream na Cito se o `match.id`
-      // ainda não estiver registrado no `Set` de conexões ativas.
-      if (activeCitoMatches.has(match.id)) {
-        continue;
-      }
-
-      await mappingService.linkProviderId({
-        provider: 'cito',
-        entityType: 'match',
-        externalId: match.externalCitoId,
-        entityId: match.id,
-      });
-
-      citoAdapter.connectToLiveMatch(match.externalCitoId);
-      activeCitoMatches.add(match.id);
-
-      console.info(
-        `[cron:watchdog] Stream Cito iniciado para a partida ${match.id} (external=${match.externalCitoId}, conexões ativas=${activeCitoMatches.size})`,
-      );
-    }
+    await startTrackingTargets(rows.map(toTrackingTarget), citoAdapter, 'watchdog');
   } catch (err) {
     console.error('[cron:watchdog] Erro ao executar verificação de partidas ao vivo:', err);
   }
@@ -169,8 +265,11 @@ export async function runLiveWatchdogOnce(
 
 // Agenda o Watchdog de partidas ao vivo para rodar a cada 1 minuto ('* * * * *').
 export function scheduleLiveWatchdog(
-  citoAdapter: CitoAdapter = defaultCitoAdapter,
+  citoAdapter: CitoAdapter = activeCitoAdapter,
 ): ScheduledTask {
+  // [UPDATE]: Registra a instância como ativa para reuso pela rota manual.
+  activeCitoAdapter = citoAdapter;
+
   const task = cron.schedule(
     '* * * * *',
     async () => {
@@ -201,7 +300,7 @@ export function startAllJobs(deps?: {
  * Desligamento Seguro: interrompe todas as tasks agendadas no `node-cron`,
  * fecha os streams ativos da Cito e limpa o `Set` de partidas monitoradas.
  */
-export async function stopAllJobs(citoAdapter: CitoAdapter = defaultCitoAdapter): Promise<void> {
+export async function stopAllJobs(citoAdapter: CitoAdapter = activeCitoAdapter): Promise<void> {
   const tasksToStop = scheduledTasks.splice(0, scheduledTasks.length);
   await Promise.allSettled(tasksToStop.map((task) => Promise.resolve(task.stop())));
 
