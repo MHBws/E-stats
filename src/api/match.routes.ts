@@ -13,6 +13,9 @@
 // =============================================================================
 import type { FastifyInstance } from 'fastify';
 import { MatchService, matchService } from '../core/match.service.js';
+// [UPDATE]: Importa os gatilhos de sincronização da PandaScore e do Watchdog Cito
+// para expor a rota manual `GET /api/sync/force`.
+import { runLiveWatchdogOnce, runPandaScoreSyncOnce } from '../workers/cron.manager.js';
 
 export interface MatchesQuerystring {
   status?: string;
@@ -68,6 +71,27 @@ export async function matchRoutes(
       return reply.code(500).send({
         error: 'Internal Server Error',
         message: 'Falha ao buscar os detalhes da partida.',
+      });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // [UPDATE]: GET /sync/force — Gatilho manual para sincronizar a PandaScore
+  // e iniciar o Watchdog da Cito imediatamente no banco de dados local.
+  // ---------------------------------------------------------------------------
+  app.get('/sync/force', async (request, reply) => {
+    try {
+      await runPandaScoreSyncOnce();
+      await runLiveWatchdogOnce();
+      return reply.code(200).send({
+        success: true,
+        message: 'Sincronização forçada concluída com sucesso!',
+      });
+    } catch (err) {
+      request.log.error({ err }, '[api] Erro ao executar sincronização forçada em GET /sync/force');
+      return reply.code(500).send({
+        success: false,
+        message: 'Falha ao executar a sincronização forçada.',
       });
     }
   });

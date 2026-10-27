@@ -25,6 +25,8 @@ import { CitoAdapter } from './providers/cito/cito.adapter.js';
 // [UPDATE]: Módulo 6 — Importa os agendadores de Cron Jobs (PandaScore Sync 6h
 // e Live Watchdog 1min) e a rotina de parada segura (`stopAllJobs`).
 import {
+  runLiveWatchdogOnce,
+  runPandaScoreSyncOnce,
   scheduleLiveWatchdog,
   schedulePandaScoreSync,
   stopAllJobs,
@@ -73,6 +75,14 @@ async function bootstrap(): Promise<void> {
   // para que o port-forwarding do Docker e o loopback `10.0.2.2` do emulador
   // Android alcancem o Fastify sem bloqueio de loopback local (`127.0.0.1`).
   await app.listen({ host: '0.0.0.0', port: env.port });
+
+  // [UPDATE]: Dispara uma sincronização imediata pós-boot (sem aguardar o ciclo
+  // de 6h do cron) para garantir que o PostgreSQL e o Redis já iniciem populados.
+  void runPandaScoreSyncOnce(pandaScoreAdapter)
+    .then(() => runLiveWatchdogOnce(citoAdapter))
+    .catch((err: unknown) => {
+      app.log.error({ err }, '[workers] Erro na sincronização inicial pós-boot');
+    });
 }
 
 /** Encerra servidor e conexões de forma ordenada. */

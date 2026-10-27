@@ -60,43 +60,19 @@ const defaultCitoAdapter = new CitoAdapter(defaultMapper);
  */
 export async function runPandaScoreSyncOnce(
   pandaAdapter: PandaScoreAdapter = defaultPandaScoreAdapter,
-): Promise<void> {
+): Promise<number> {
   try {
-    const upcomingMatches = await pandaAdapter.fetchUpcomingMatches();
-
-    // -------------------------------------------------------------------------
-    // [SIMULAÇÃO DE PERSISTÊNCIA NO POSTGRESQL — UPSERT DE CALENDÁRIO]
-    // Quando conectado ao banco populado em produção, este laço persiste cada
-    // partida convertida pelo Adapter e registra o vínculo no MappingService:
-    //
-    // for (const match of upcomingMatches) {
-    //   await db.query(
-    //     `INSERT INTO matches (id, tournament_id, team_a_id, team_b_id, format, status, scheduled_at)
-    //      VALUES ($1, $2, $3, $4, $5, $6, $7)
-    //      ON CONFLICT (id) DO UPDATE
-    //        SET status = EXCLUDED.status,
-    //            scheduled_at = EXCLUDED.scheduled_at,
-    //            team_a_id = EXCLUDED.team_a_id,
-    //            team_b_id = EXCLUDED.team_b_id,
-    //            updated_at = NOW()`,
-    //     [
-    //       match.id,
-    //       match.tournamentId,
-    //       match.teamAId,
-    //       match.teamBId,
-    //       match.format,
-    //       match.status,
-    //       match.scheduledAt,
-    //     ],
-    //   );
-    // }
-    // -------------------------------------------------------------------------
+    // [UPDATE]: Chama `syncMatches()` para buscar na PandaScore e fazer UPSERT real
+    // de torneios, times, partidas, mapas e vínculos no PostgreSQL.
+    const syncedMatches = await pandaAdapter.syncMatches();
 
     console.info(
-      `[cron:pandascore] Sincronização concluída: ${upcomingMatches.length} partidas futuras processadas.`,
+      `[cron:pandascore] Sincronização concluída: ${syncedMatches.length} partidas persistidas no banco.`,
     );
+    return syncedMatches.length;
   } catch (err) {
     console.error('[cron:pandascore] Falha ao sincronizar partidas da PandaScore:', err);
+    throw err;
   }
 }
 
