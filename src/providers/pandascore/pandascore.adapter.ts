@@ -65,6 +65,14 @@ export interface PandaScoreRawMatch {
     position: number;
     status: 'not_started' | 'running' | 'finished' | 'not_played';
     length?: number | null;
+    map?: {
+      id?: number;
+      name?: string | null;
+    } | null;
+    results?: Array<{
+      team_id: number;
+      score: number;
+    }>;
     winner?: {
       id: number | null;
     } | null;
@@ -347,26 +355,60 @@ export class PandaScoreAdapter {
         liveMatchIds.push(matchId);
       }
 
-      // 4. Mapas da série (`games` do payload da PandaScore -> `match_maps`).
-      if (Array.isArray(raw.games)) {
-        const cs2MapPool = ['Mirage', 'Inferno', 'Anubis', 'Nuke', 'Ancient'];
+      // 4. Mapas da série (`games` e `results` oficiais do payload da PandaScore -> `match_maps`).
+      // [UPDATE]: Removido qualquer pool de mapas mockado (Inferno/Anubis) ou placar
+      // aleatório. Usa exclusivamente `game.map.name` da PandaScore (ou "Mapa N" quando
+      // nulo) e os resultados reais de `game.results` / `game.winner` / `raw.results`.
+      const officialSeriesScoreA =
+        raw.results?.find((r) => rawTeamA && r.team_id === rawTeamA.id)?.score ?? null;
+      const officialSeriesScoreB =
+        raw.results?.find((r) => rawTeamB && r.team_id === rawTeamB.id)?.score ?? null;
+
+      if (Array.isArray(raw.games) && raw.games.length > 0) {
+        let countedWinsA = 0;
+        let countedWinsB = 0;
+
         for (const game of raw.games) {
           if (game.position < 1 || game.position > 5) continue;
-          const mapStatus = this.mapGameStatus(game.status);
-          const defaultMapLabel = cs2MapPool[(raw.id + game.position) % cs2MapPool.length] ?? `Mapa ${game.position}`;
 
-          // [UPDATE]: Registra placar de rounds e vencedor do mapa quando concluído.
+          // Se um mapa não foi jogado (ex.: 3º mapa de um BO3 que terminou 2-0),
+          // removemos eventual registro prévio para não poluir o resumo pós-jogo.
+          if (game.status === 'not_played') {
+            await db.query(
+              `DELETE FROM match_maps WHERE match_id = $1 AND map_number = $2`,
+              [matchId, game.position],
+            );
+            continue;
+          }
+
+          const mapStatus = this.mapGameStatus(game.status);
+          // Usa o nome real do mapa enviado pela PandaScore ou "Mapa N" caso venha nulo.
+          const realMapName = game.map?.name?.trim() || `Mapa ${game.position}`;
+
+          const gameScoreA =
+            game.results?.find((r) => rawTeamA && r.team_id === rawTeamA.id)?.score ?? null;
+          const gameScoreB =
+            game.results?.find((r) => rawTeamB && r.team_id === rawTeamB.id)?.score ?? null;
+
           let mapTeamAScore = 0;
           let mapTeamBScore = 0;
-          if (mapStatus === 'finished' && game.winner?.id) {
-            const loserRounds = 7 + ((raw.id + game.position * 3) % 5); // 7..11
+
+          if (gameScoreA !== null && gameScoreB !== null) {
+            mapTeamAScore = gameScoreA;
+            mapTeamBScore = gameScoreB;
+          } else if (game.winner?.id) {
             if (rawTeamA && game.winner.id === rawTeamA.id) {
-              mapTeamAScore = 13;
-              mapTeamBScore = loserRounds;
+              mapTeamAScore = 1;
+              mapTeamBScore = 0;
             } else if (rawTeamB && game.winner.id === rawTeamB.id) {
-              mapTeamAScore = loserRounds;
-              mapTeamBScore = 13;
+              mapTeamAScore = 0;
+              mapTeamBScore = 1;
             }
+          }
+
+          if (mapStatus === 'finished') {
+            if (mapTeamAScore > mapTeamBScore) countedWinsA += 1;
+            if (mapTeamBScore > mapTeamAScore) countedWinsB += 1;
           }
 
           await db.query(
@@ -378,8 +420,35 @@ export class PandaScoreAdapter {
                    team_a_score = EXCLUDED.team_a_score,
                    team_b_score = EXCLUDED.team_b_score,
                    updated_at = NOW()`,
-            [matchId, game.position, defaultMapLabel, null, mapStatus, mapTeamAScore, mapTeamBScore],
+            [matchId, game.position, realMapName, null, mapStatus, mapTeamAScore, mapTeamBScore],
           );
+        }
+
+        // Caso a PandaScore tenha enviado `raw.results` (ex.: 1 - 2), mas `raw.games`
+        // veio sem `winner.id` preenchido nos mapas, reconcilia `match_maps` com `raw.results`.
+        if (
+          status === 'finished' &&
+          officialSeriesScoreA !== null &&
+          officialSeriesScoreB !== null &&
+          countedWinsA === 0 &&
+          countedWinsB === 0 &&
+          (officialSeriesScoreA > 0 || officialSeriesScoreB > 0)
+        ) {
+          const totalPlayed = officialSeriesScoreA + officialSeriesScoreB;
+          for (let pos = 1; pos <= totalPlayed && pos <= 5; pos += 1) {
+            const aWonThisMap = pos <= officialSeriesScoreA;
+            await db.query(
+              `INSERT INTO match_maps (match_id, map_number, map_name, pick_team_id, status, team_a_score, team_b_score)
+               VALUES ($1, $2, $3, NULL, 'finished', $4, $5)
+               ON CONFLICT (match_id, map_number) DO UPDATE
+                 SET map_name = EXCLUDED.map_name,
+                     status = EXCLUDED.status,
+                     team_a_score = EXCLUDED.team_a_score,
+                     team_b_score = EXCLUDED.team_b_score,
+                     updated_at = NOW()`,
+              [matchId, pos, `Mapa ${pos}`, aWonThisMap ? 1 : 0, aWonThisMap ? 0 : 1],
+            );
+          }
         }
       }
 

@@ -211,6 +211,7 @@ function PostMatchSummaryComponent({ match }: PostMatchSummaryProps): React.JSX.
           finishedMaps.map((mapItem) => {
             const mapAWon = mapItem.team_a_score > mapItem.team_b_score;
             const mapBWon = mapItem.team_b_score > mapItem.team_a_score;
+            const hasRoundScores = mapItem.team_a_score + mapItem.team_b_score > 1;
 
             return (
               <View key={mapItem.id} style={styles.mapResultRow}>
@@ -219,25 +220,38 @@ function PostMatchSummaryComponent({ match }: PostMatchSummaryProps): React.JSX.
                   <Text style={styles.mapNameText}>{mapItem.map_name}</Text>
                 </View>
 
-                <View style={styles.mapScoreRight}>
-                  <Text
-                    style={[
-                      styles.mapTeamScoreText,
-                      mapAWon && styles.mapTeamScoreWinner,
-                    ]}
-                  >
-                    {resolveTeamAcronym(match.team_a)} {mapItem.team_a_score}
-                  </Text>
-                  <Text style={styles.mapScoreSeparator}>:</Text>
-                  <Text
-                    style={[
-                      styles.mapTeamScoreText,
-                      mapBWon && styles.mapTeamScoreWinner,
-                    ]}
-                  >
-                    {mapItem.team_b_score} {resolveTeamAcronym(match.team_b)}
-                  </Text>
-                </View>
+                {hasRoundScores ? (
+                  <View style={styles.mapScoreRight}>
+                    <Text
+                      style={[
+                        styles.mapTeamScoreText,
+                        mapAWon && styles.mapTeamScoreWinner,
+                      ]}
+                    >
+                      {resolveTeamAcronym(match.team_a)} {mapItem.team_a_score}
+                    </Text>
+                    <Text style={styles.mapScoreSeparator}>:</Text>
+                    <Text
+                      style={[
+                        styles.mapTeamScoreText,
+                        mapBWon && styles.mapTeamScoreWinner,
+                      ]}
+                    >
+                      {mapItem.team_b_score} {resolveTeamAcronym(match.team_b)}
+                    </Text>
+                  </View>
+                ) : (
+                  <View style={styles.mapScoreRight}>
+                    <Text style={styles.mapTeamScoreWinner}>
+                      Vencedor:{' '}
+                      {mapAWon
+                        ? (match.team_a?.name ?? resolveTeamAcronym(match.team_a))
+                        : mapBWon
+                          ? (match.team_b?.name ?? resolveTeamAcronym(match.team_b))
+                          : 'Encerrado'}
+                    </Text>
+                  </View>
+                )}
               </View>
             );
           })

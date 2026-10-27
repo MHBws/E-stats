@@ -79,6 +79,8 @@ export interface MatchCardDto {
   status: MatchStatus;
   scheduled_at: string;
   winner_id: UUID | null;
+  // [UPDATE]: Placar geral da série unificado entre `MatchCardDto` (Home) e `MatchDetailDto` (Detalhes).
+  results: MatchSeriesResultsDto;
   tournament: MatchTournamentSummary;
   team_a: MatchTeamSummary | null;
   team_b: MatchTeamSummary | null;
@@ -110,6 +112,8 @@ interface MatchJoinedRow {
   status: MatchStatus;
   scheduled_at: Date;
   winner_id: UUID | null;
+  team_a_maps_won?: number | string | null;
+  team_b_maps_won?: number | string | null;
   tournament_id: UUID;
   tournament_name: string;
   tournament_tier: TournamentTier | null;
@@ -138,8 +142,39 @@ const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 
+/** Calcula o placar da série (`results`) de forma unificada a partir dos mapas vencidos ou `winner_id`. */
+function resolveSeriesResults(params: {
+  status: MatchStatus;
+  format: MatchFormat;
+  winnerId: UUID | null;
+  teamAId: UUID | null;
+  teamBId: UUID | null;
+  teamAMapsWon: number;
+  teamBMapsWon: number;
+}): MatchSeriesResultsDto {
+  let scoreA = params.teamAMapsWon;
+  let scoreB = params.teamBMapsWon;
+
+  if (params.status === 'finished' && scoreA === 0 && scoreB === 0) {
+    const targetWins = params.format === 'BO1' ? 1 : params.format === 'BO5' ? 3 : 2;
+    if (params.winnerId && params.winnerId === params.teamAId) {
+      scoreA = targetWins;
+    } else if (params.winnerId && params.winnerId === params.teamBId) {
+      scoreB = targetWins;
+    }
+  }
+
+  return {
+    team_a_score: scoreA,
+    team_b_score: scoreB,
+  };
+}
+
 /** Converte uma linha plana do SQL JOIN para o objeto aninhado `MatchCardDto`. */
 function mapRowToMatchCard(row: MatchJoinedRow): MatchCardDto {
+  const teamAMapsWon = Number(row.team_a_maps_won ?? 0) || 0;
+  const teamBMapsWon = Number(row.team_b_maps_won ?? 0) || 0;
+
   return {
     id: row.match_id,
     format: row.format,
@@ -149,6 +184,15 @@ function mapRowToMatchCard(row: MatchJoinedRow): MatchCardDto {
         ? row.scheduled_at.toISOString()
         : new Date(row.scheduled_at).toISOString(),
     winner_id: row.winner_id,
+    results: resolveSeriesResults({
+      status: row.status,
+      format: row.format,
+      winnerId: row.winner_id,
+      teamAId: row.team_a_id,
+      teamBId: row.team_b_id,
+      teamAMapsWon,
+      teamBMapsWon,
+    }),
     tournament: {
       id: row.tournament_id,
       name: row.tournament_name,
@@ -245,6 +289,8 @@ export class MatchService {
         m.status        AS status,
         m.scheduled_at  AS scheduled_at,
         m.winner_id     AS winner_id,
+        COALESCE(ms.team_a_maps_won, 0) AS team_a_maps_won,
+        COALESCE(ms.team_b_maps_won, 0) AS team_b_maps_won,
         t.id            AS tournament_id,
         t.name          AS tournament_name,
         t.tier          AS tournament_tier,
@@ -260,6 +306,13 @@ export class MatchService {
       INNER JOIN tournaments t ON t.id = m.tournament_id
       LEFT JOIN teams ta       ON ta.id = m.team_a_id
       LEFT JOIN teams tb       ON tb.id = m.team_b_id
+      LEFT JOIN LATERAL (
+        SELECT
+          COUNT(*) FILTER (WHERE mm.status = 'finished' AND mm.team_a_score > mm.team_b_score)::int AS team_a_maps_won,
+          COUNT(*) FILTER (WHERE mm.status = 'finished' AND mm.team_b_score > mm.team_a_score)::int AS team_b_maps_won
+        FROM match_maps mm
+        WHERE mm.match_id = m.id
+      ) ms ON TRUE
       ${whereClause}
       ORDER BY
         CASE m.status
@@ -347,23 +400,16 @@ export class MatchService {
       }
     }
 
-    // [UPDATE]: Calcula o placar consolidado da série (`results`) a partir dos mapas
-    // concluídos no banco ou do `winner_id` caso os mapas não tenham placar detalhado.
-    let teamAMapsWon = maps.filter(
-      (m) => m.status === 'finished' && m.team_a_score > m.team_b_score,
-    ).length;
-    let teamBMapsWon = maps.filter(
-      (m) => m.status === 'finished' && m.team_b_score > m.team_a_score,
-    ).length;
-
-    if (baseCard.status === 'finished' && teamAMapsWon === 0 && teamBMapsWon === 0) {
-      const targetWins = baseCard.format === 'BO1' ? 1 : baseCard.format === 'BO5' ? 3 : 2;
-      if (baseCard.winner_id && baseCard.winner_id === baseCard.team_a?.id) {
-        teamAMapsWon = targetWins;
-      } else if (baseCard.winner_id && baseCard.winner_id === baseCard.team_b?.id) {
-        teamBMapsWon = targetWins;
-      }
-    }
+    // [UPDATE]: Unifica o cálculo de `results` usando exatamente `resolveSeriesResults`.
+    const results = resolveSeriesResults({
+      status: baseCard.status,
+      format: baseCard.format,
+      winnerId: baseCard.winner_id,
+      teamAId: baseCard.team_a?.id ?? null,
+      teamBId: baseCard.team_b?.id ?? null,
+      teamAMapsWon: maps.filter((m) => m.status === 'finished' && m.team_a_score > m.team_b_score).length,
+      teamBMapsWon: maps.filter((m) => m.status === 'finished' && m.team_b_score > m.team_a_score).length,
+    });
 
     // [UPDATE]: Busca rosters reais (`players`) e estatísticas pós-jogo (`players_stats`)
     // via PandaScore API.
@@ -404,10 +450,7 @@ export class MatchService {
           }
         : null,
       maps,
-      results: {
-        team_a_score: teamAMapsWon,
-        team_b_score: teamBMapsWon,
-      },
+      results,
       players_stats: playersStats,
     };
   }

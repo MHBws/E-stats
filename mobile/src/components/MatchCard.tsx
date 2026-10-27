@@ -118,23 +118,15 @@ function MatchCardComponent({ match, onPress }: MatchCardProps): React.JSX.Eleme
   const showTeamALogo = Boolean(teamALogoUrl) && !teamALogoError;
   const showTeamBLogo = Boolean(teamBLogoUrl) && !teamBLogoError;
 
-  // [UPDATE]: Define o placar exibido na série com base no `winner_id` para jogos
-  // finalizados (ou 0-0 / 1-0 caso ainda em andamento).
+  // [UPDATE]: Lê exatamente `match.results` (mesma fonte oficial do `PostMatchSummary`)
+  // para evitar qualquer divergência de placar entre a Home e a tela de Detalhes.
   const targetWins = match.format === 'BO1' ? 1 : match.format === 'BO5' ? 3 : 2;
   const teamAScore =
-    isFinished && match.winner_id
-      ? match.winner_id === match.team_a?.id
-        ? targetWins
-        : 0
-      : isLive
-        ? 1
-        : 0;
+    match.results?.team_a_score ??
+    (isFinished && match.winner_id === match.team_a?.id ? targetWins : 0);
   const teamBScore =
-    isFinished && match.winner_id
-      ? match.winner_id === match.team_b?.id
-        ? targetWins
-        : 0
-      : 0;
+    match.results?.team_b_score ??
+    (isFinished && match.winner_id === match.team_b?.id ? targetWins : 0);
 
   return (
     // [UPDATE]: Módulo 8 — `Pressable` nativo com feedback tátil de opacidade

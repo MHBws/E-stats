@@ -51,6 +51,12 @@ export interface MatchTeamSummary {
   players?: MatchRosterPlayerDto[];
 }
 
+/** [UPDATE]: Placar final consolidado da série unificado entre listagem e detalhes. */
+export interface MatchSeriesResultsDto {
+  team_a_score: number;
+  team_b_score: number;
+}
+
 /** Card de partida retornado por `GET /api/matches`. */
 export interface MatchCardDto {
   id: UUID;
@@ -58,6 +64,8 @@ export interface MatchCardDto {
   status: MatchStatus;
   scheduled_at: string;
   winner_id: UUID | null;
+  // [UPDATE]: Propriedade oficial `results` unificada com `MatchDetailDto`.
+  results?: MatchSeriesResultsDto;
   tournament: MatchTournamentSummary;
   /** `null` quando o time ainda não foi definido no chaveamento ("TBD"). */
   team_a: MatchTeamSummary | null;
@@ -72,12 +80,6 @@ export interface MatchMapDetailDto {
   /** `null` quando é o mapa Decider (desempate). */
   pick_team_id: UUID | null;
   status: MapStatus;
-  team_a_score: number;
-  team_b_score: number;
-}
-
-/** [UPDATE]: Placar final consolidado da série em `MatchDetailDto.results`. */
-export interface MatchSeriesResultsDto {
   team_a_score: number;
   team_b_score: number;
 }
