@@ -242,6 +242,12 @@ export class PandaScoreAdapter {
     { fetchedAt: number; data: PreMatchStatsDto }
   >();
   /**
+   * [UPDATE]: Throttle por partida (12s) para checagem rápida de transição de status
+   * (`scheduled` -> `live` / `finished`) quando o Smart Polling mobile consulta
+   * `GET /api/matches/:id` perto ou após o horário agendado.
+   */
+  private readonly statusProbeThrottle = new Map<string, number>();
+  /**
    * [UPDATE]: UUIDs das partidas com status `running` (AO VIVO) no último
    * `syncMatches()`. Consumido pelo cron.manager para o handoff à Cito Sports.
    */
@@ -916,6 +922,73 @@ export class PandaScoreAdapter {
     const opponents = Array.isArray(body?.opponents) ? body.opponents : [];
     this.opponentsCache.set(externalMatchId, { fetchedAt: now, opponents });
     return opponents;
+  }
+
+  /**
+   * [UPDATE]: Verifica sob demanda (com throttle de 12s por partida) se um jogo
+   * agendado cujo horário está próximo ou já passou (`scheduled_at <= NOW() + 15min`)
+   * já mudou para `running` (`live`) ou `finished` na PandaScore, atualizando o
+   * PostgreSQL imediatamente sem esperar o ciclo de 6h do cron.
+   */
+  async refreshImminentMatchStatus(params: {
+    matchId: UUID;
+    currentStatus: MatchStatus;
+    scheduledAtIso: string;
+  }): Promise<MatchStatus> {
+    if (params.currentStatus !== 'scheduled') {
+      return params.currentStatus;
+    }
+
+    const scheduledMs = Date.parse(params.scheduledAtIso);
+    const now = Date.now();
+    // Só consulta a API externa se faltar <= 15 min para o jogo começar (ou se já passou da hora).
+    if (!Number.isNaN(scheduledMs) && scheduledMs > now + 15 * 60 * 1_000) {
+      return params.currentStatus;
+    }
+
+    const lastProbeAt = this.statusProbeThrottle.get(params.matchId) ?? 0;
+    if (now - lastProbeAt < 12_000) {
+      return params.currentStatus;
+    }
+    this.statusProbeThrottle.set(params.matchId, now);
+
+    try {
+      const token = this.assertValidApiKey();
+      const { rows } = await db.query<{ external_id: string }>(
+        `SELECT external_id
+           FROM provider_mappings
+          WHERE provider = 'pandascore'
+            AND entity_type = 'match'
+            AND entity_id = $1
+          LIMIT 1`,
+        [params.matchId],
+      );
+      const extMatchId = rows[0]?.external_id;
+      if (!extMatchId) return params.currentStatus;
+
+      const rawMatch = await this.safeGetJson<PandaScoreRawMatch>(
+        `${this.coreApiUrl}/matches/${encodeURIComponent(extMatchId)}`,
+        token,
+      );
+      if (!rawMatch) return params.currentStatus;
+
+      const freshStatus = this.mapStatus(rawMatch.status);
+      if (freshStatus !== params.currentStatus) {
+        await db.query(
+          `UPDATE matches
+              SET status = $2,
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [params.matchId, freshStatus],
+        );
+        this.preMatchStatsCache.delete(params.matchId);
+        return freshStatus;
+      }
+    } catch {
+      // Falha transitória na sonda de status não bloqueia a leitura do detalhe.
+    }
+
+    return params.currentStatus;
   }
 
   /**

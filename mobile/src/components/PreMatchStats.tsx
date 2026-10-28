@@ -48,6 +48,13 @@ import type {
   PreMatchStreamDto,
   PreMatchTeamFormEntryDto,
 } from '../types/match';
+// [UPDATE]: Conversão de fuso horário UTC -> Local do aparelho via `toLocaleTimeString`
+// / ICU nativo, mantendo o destaque "Hoje" baseado na data civil local.
+import {
+  formatLocalFullDate,
+  formatPreMatchSchedule,
+  parseUtcIsoDate,
+} from '../utils/dateTime';
 
 export interface PreMatchStatsProps {
   match: MatchDetailDto;
@@ -74,31 +81,14 @@ const EMPTY_H2H: PreMatchH2HSummaryDto = {
   matches: [],
 };
 
-/** Formata a data e o horário agendado (`DD/MM/YYYY • HH:mm`). */
-function formatScheduledDateTime(isoDate: string): string {
-  const date = new Date(isoDate);
-  if (Number.isNaN(date.getTime())) return 'Horário a definir';
-  const day = String(date.getDate()).padStart(2, '0');
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const year = date.getFullYear();
-  const hours = String(date.getHours()).padStart(2, '0');
-  const minutes = String(date.getMinutes()).padStart(2, '0');
-  return `${day}/${month}/${year} • ${hours}:${minutes}`;
-}
-
-/** Formata uma data histórica ISO em `DD/MM/YYYY`. */
+/** Formata uma data histórica ISO UTC em `DD/MM/YYYY` no fuso local do aparelho. */
 function formatShortDate(isoDate: string): string {
-  const date = new Date(isoDate);
-  if (Number.isNaN(date.getTime())) return '—';
-  const day = String(date.getDate()).padStart(2, '0');
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const year = date.getFullYear();
-  return `${day}/${month}/${year}`;
+  return formatLocalFullDate(isoDate);
 }
 
 /** Calcula o texto do contador regressivo até o início da partida. */
 function formatCountdown(isoDate: string, nowMs: number): string {
-  const targetMs = new Date(isoDate).getTime();
+  const targetMs = parseUtcIsoDate(isoDate).getTime();
   if (Number.isNaN(targetMs)) return 'AGUARDANDO HORÁRIO';
   const diffMs = targetMs - nowMs;
   if (diffMs <= 0) return 'PRESTES A COMEÇAR';
@@ -284,9 +274,31 @@ const PreMatchTopSection = memo(function PreMatchTopSection({
               {formatCountdown(match.scheduled_at, nowMs)}
             </Text>
           </View>
-          <Text style={styles.scheduledDateText}>
-            {formatScheduledDateTime(match.scheduled_at)}
-          </Text>
+          {(() => {
+            const schedule = formatPreMatchSchedule(
+              match.scheduled_at,
+              new Date(nowMs),
+            );
+            if (!schedule) {
+              return <Text style={styles.scheduledDateText}>Horário a definir</Text>;
+            }
+            if (schedule.isToday) {
+              return (
+                <Text style={styles.scheduledDateText}>
+                  <Text style={styles.scheduledTodayHighlight}>Hoje</Text>
+                  <Text style={styles.scheduledDateText}>
+                    {' '}
+                    ({schedule.datePart}) • {schedule.timePart}
+                  </Text>
+                </Text>
+              );
+            }
+            return (
+              <Text style={styles.scheduledDateText}>
+                {schedule.datePart} • {schedule.timePart}
+              </Text>
+            );
+          })()}
         </View>
       </View>
 
@@ -1042,6 +1054,10 @@ const styles = StyleSheet.create({
     color: '#8E8E93',
     fontSize: 12,
     fontWeight: '600',
+  },
+  scheduledTodayHighlight: {
+    color: '#22c55e',
+    fontWeight: '800',
   },
   // Barra de Abas Horizontais ("Detalhes" | "Classificações" | "Partidas")
   tabBarContainer: {

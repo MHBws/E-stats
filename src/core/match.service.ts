@@ -33,6 +33,9 @@ import {
   type PandaScoreRosterPlayer,
   type PreMatchStatsDto,
 } from '../providers/pandascore/pandascore.adapter.js';
+// [UPDATE]: Aciona handoff imediato para a Cito Sports quando o Smart Polling
+// detecta que uma partida agendada acabou de entrar ao vivo (`status === 'live'`).
+import { handoffLiveMatchesToCito } from '../workers/cron.manager.js';
 
 /** Abas estilo Apple Sports suportadas pelo filtro de listagem. */
 export type MatchTabFilter = 'yesterday' | 'today' | 'upcoming';
@@ -381,6 +384,27 @@ export class MatchService {
     }
 
     const baseCard = mapRowToMatchCard(firstRow);
+
+    // [UPDATE]: Suporte ao Smart Polling mobile — se a partida ainda consta como
+    // `'scheduled'` no banco mas já entrou na janela de início (<= 15 min ou já passou),
+    // verifica o status fresco na PandaScore (com throttle de 12s). Se virou `'live'`,
+    // atualiza o Postgres e dispara o handoff imediato para a Cito Sports.
+    if (baseCard.status === 'scheduled') {
+      const freshStatus = await this.pandaAdapter.refreshImminentMatchStatus({
+        matchId: baseCard.id,
+        currentStatus: baseCard.status,
+        scheduledAtIso: baseCard.scheduled_at,
+      });
+      if (freshStatus !== baseCard.status) {
+        baseCard.status = freshStatus;
+        if (freshStatus === 'live') {
+          void handoffLiveMatchesToCito([baseCard.id]).catch(() => {
+            // O watchdog de 1m atua como fallback caso o handoff falhe.
+          });
+        }
+      }
+    }
+
     const maps: MatchMapDetailDto[] = [];
 
     for (const row of result.rows) {

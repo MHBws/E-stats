@@ -34,6 +34,9 @@ import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { fetchMatches } from '../api/apiClient';
 import { MatchCard } from '../components/MatchCard';
 import type { MatchCardDto, RootStackParamList } from '../types/match';
+// [UPDATE]: Usa comparação de data civil no fuso local do aparelho (ICU/Intl)
+// para que as abas "Ontem", "Hoje" e "Próximos" coincidam 100% com o horário local.
+import { compareWithLocalToday, parseUtcIsoDate } from '../utils/dateTime';
 
 export type HomeScreenProps = NativeStackScreenProps<RootStackParamList, 'Home'>;
 
@@ -48,20 +51,6 @@ const TABS: Array<{ key: HomeTab; label: string }> = [
 
 // `keyExtractor` estático fora do componente evita recriação de closure a cada render.
 const extractMatchKey = (item: MatchCardDto): string => item.id;
-
-/**
- * [UPDATE]: Calcula os limites do dia atual (00:00:00.000 até 23:59:59.999)
- * no fuso horário local do dispositivo para classificar as partidas nas abas.
- */
-function getTodayBounds(): { startOfTodayMs: number; endOfTodayMs: number } {
-  const now = new Date();
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
-  const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
-  return {
-    startOfTodayMs: startOfToday.getTime(),
-    endOfTodayMs: endOfToday.getTime(),
-  };
-}
 
 export function HomeScreen({ navigation }: HomeScreenProps): React.JSX.Element {
   const [matches, setMatches] = useState<MatchCardDto[]>([]);
@@ -99,21 +88,19 @@ export function HomeScreen({ navigation }: HomeScreenProps): React.JSX.Element {
     void loadMatches(false);
   }, [loadMatches]);
 
-  // [UPDATE]: Filtra e ordena instantaneamente as partidas em memória conforme a aba ativa:
-  //   - 'yesterday': status === 'finished' OU data estritamente anterior a hoje.
-  //   - 'today':     status === 'live' OU data exatamente no dia de hoje.
-  //   - 'upcoming':  data estritamente posterior ao dia de hoje.
+  // [UPDATE]: Filtra e ordena instantaneamente as partidas em memória conforme a aba ativa
+  // respeitando estritamente o dia civil no fuso horário local do aparelho:
+  //   - 'yesterday': status === 'finished' OU data local estritamente anterior a hoje.
+  //   - 'today':     status === 'live' OU data local exatamente no dia de hoje (não finalizada).
+  //   - 'upcoming':  data local estritamente posterior ao dia de hoje.
   const filteredMatches = useMemo((): MatchCardDto[] => {
-    const { startOfTodayMs, endOfTodayMs } = getTodayBounds();
+    const now = new Date();
 
     const filtered = matches.filter((match) => {
-      const matchTimeMs = new Date(match.scheduled_at).getTime();
-      const hasValidDate = !Number.isNaN(matchTimeMs);
-
-      const isBeforeToday = hasValidDate && matchTimeMs < startOfTodayMs;
-      const isSameDayAsToday =
-        hasValidDate && matchTimeMs >= startOfTodayMs && matchTimeMs <= endOfTodayMs;
-      const isAfterToday = hasValidDate && matchTimeMs > endOfTodayMs;
+      const relation = compareWithLocalToday(match.scheduled_at, now);
+      const isBeforeToday = relation === 'before';
+      const isSameDayAsToday = relation === 'today';
+      const isAfterToday = relation === 'after';
 
       if (activeTab === 'yesterday') {
         return match.status === 'finished' || isBeforeToday;
@@ -130,7 +117,9 @@ export function HomeScreen({ navigation }: HomeScreenProps): React.JSX.Element {
     // Na aba "Ontem", ordena das mais recentes para as mais antigas.
     if (activeTab === 'yesterday') {
       return [...filtered].sort(
-        (a, b) => new Date(b.scheduled_at).getTime() - new Date(a.scheduled_at).getTime(),
+        (a, b) =>
+          parseUtcIsoDate(b.scheduled_at).getTime() -
+          parseUtcIsoDate(a.scheduled_at).getTime(),
       );
     }
 

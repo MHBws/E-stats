@@ -419,6 +419,11 @@ const LiveScoreboard = memo(function LiveScoreboard({
 // =============================================================================
 // Componente Principal — LiveMatchScreen (Orquestrador Pré / Live / Pós)
 // =============================================================================
+// [UPDATE]: Intervalo de Smart Polling (15s) para partidas pré-jogo ('not_started'
+// ou 'scheduled'), permitindo transição automática para <LiveScoreboard /> + WebSocket
+// assim que a partida iniciar no servidor.
+const SMART_POLL_INTERVAL_MS = 15_000;
+
 export function LiveMatchScreen({ route }: LiveMatchScreenProps): React.JSX.Element {
   const { matchId } = route.params;
 
@@ -446,6 +451,67 @@ export function LiveMatchScreen({ route }: LiveMatchScreenProps): React.JSX.Elem
   useEffect(() => {
     void loadDetail();
   }, [loadDetail]);
+
+  // ---------------------------------------------------------------------------
+  // [UPDATE]: Smart Polling para Auto-Transição Pré-Jogo -> Ao Vivo
+  // O QUE: Monitora `matchDetail.status`. Enquanto a partida estiver em estado
+  //        pré-jogo (`'not_started'` ou `'scheduled'`), consulta silenciosamente
+  //        `GET /api/matches/:id` a cada 15 segundos.
+  // POR QUE:
+  //   - Sem `setLoadingDetail(true)` no background, evita piscar a tela ou perder
+  //     a aba selecionada no `<PreMatchStats />`.
+  //   - Assim que a API retorna `status === 'live'` (ou `'finished'`), atualiza
+  //     `matchDetail`, o que: (1) dispara o cleanup `clearInterval` imediatamente,
+  //     (2) desmonta `<PreMatchStats />`, (3) monta `<LiveScoreboard />` e
+  //     (4) ativa `useLiveMatch(matchId)` abrindo o WebSocket da Cito Sports.
+  // ---------------------------------------------------------------------------
+  const currentStatus = matchDetail?.status;
+  const shouldPollPreMatch =
+    currentStatus === 'not_started' || currentStatus === 'scheduled';
+
+  useEffect(() => {
+    if (!shouldPollPreMatch) {
+      return;
+    }
+
+    let isCancelled = false;
+    let isRequestInFlight = false;
+
+    const intervalId = setInterval(() => {
+      if (isCancelled || isRequestInFlight) {
+        return;
+      }
+      isRequestInFlight = true;
+
+      fetchMatchById(matchId)
+        .then((freshDetail) => {
+          if (isCancelled) return;
+          setMatchDetail((prev) => {
+            if (!prev) return freshDetail;
+            if (
+              prev.status !== freshDetail.status ||
+              prev.scheduled_at !== freshDetail.scheduled_at ||
+              prev.winner_id !== freshDetail.winner_id
+            ) {
+              return freshDetail;
+            }
+            return prev;
+          });
+        })
+        .catch(() => {
+          // Oscilações transitórias durante o polling silencioso são ignoradas
+          // para manter a interface pré-jogo estável na tela.
+        })
+        .finally(() => {
+          isRequestInFlight = false;
+        });
+    }, SMART_POLL_INTERVAL_MS);
+
+    return () => {
+      isCancelled = true;
+      clearInterval(intervalId);
+    };
+  }, [matchId, shouldPollPreMatch]);
 
   // [UPDATE]: O WebSocket SÓ é instanciado e consumido quando `match.status === 'live'`.
   const isLiveMatch = matchDetail?.status === 'live';

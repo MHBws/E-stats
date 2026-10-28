@@ -27,52 +27,14 @@ import React, { memo, useEffect, useState } from 'react';
 // [UPDATE]: Importa `Image` do React Native para renderizar os escudos dos times.
 import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
 import type { MatchCardDto, MatchTeamSummary } from '../types/match';
+// [UPDATE]: Conversão centralizada de UTC para o fuso horário local do aparelho
+// via `toLocaleTimeString` / ICU nativo, mantendo o destaque "Hoje" em data local.
+import { formatMatchCardSchedule } from '../utils/dateTime';
 
 export interface MatchCardProps {
   match: MatchCardDto;
   // [UPDATE]: Módulo 8 — Callback disparado ao tocar no card para abrir a `LiveMatchScreen`.
   onPress?: (match: MatchCardDto) => void;
-}
-
-/**
- * [UPDATE]: Analisa a data/hora da partida (`scheduled_at` / `beginAt`) e
- * identifica se o confronto ocorre no dia atual (Hoje) no fuso local do usuário.
- */
-interface FormattedSchedule {
-  isToday: boolean;
-  dateLabel: string;
-  timeLabel: string;
-}
-
-function formatMatchSchedule(isoDate: string): FormattedSchedule {
-  const date = new Date(isoDate);
-  if (Number.isNaN(date.getTime())) {
-    return {
-      isToday: false,
-      dateLabel: '--/--',
-      timeLabel: '--:--',
-    };
-  }
-
-  const now = new Date();
-  const isToday =
-    date.getFullYear() === now.getFullYear() &&
-    date.getMonth() === now.getMonth() &&
-    date.getDate() === now.getDate();
-
-  const hours = String(date.getHours()).padStart(2, '0');
-  const minutes = String(date.getMinutes()).padStart(2, '0');
-  const timeLabel = `${hours}:${minutes}`;
-
-  const day = String(date.getDate()).padStart(2, '0');
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const dateLabel = `${day}/${month}`;
-
-  return {
-    isToday,
-    dateLabel,
-    timeLabel,
-  };
 }
 
 /**
@@ -114,7 +76,7 @@ function MatchCardComponent({ match, onPress }: MatchCardProps): React.JSX.Eleme
   const teamBAcronym = resolveTeamFallbackAcronym(match.team_b);
   const teamBName = match.team_b?.name ?? 'A definir';
 
-  const schedule = formatMatchSchedule(match.scheduled_at);
+  const schedule = formatMatchCardSchedule(match.scheduled_at);
   const showTeamALogo = Boolean(teamALogoUrl) && !teamALogoError;
   const showTeamBLogo = Boolean(teamBLogoUrl) && !teamBLogoError;
 
