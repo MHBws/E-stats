@@ -40,6 +40,9 @@ const app = Fastify({
 const mappingService = new MappingService();
 const pandaScoreAdapter = new PandaScoreAdapter(mappingService);
 const citoAdapter = new CitoAdapter(mappingService);
+// [UPDATE]: Injeta o logger estruturado do Fastify (`app.log`) no CitoAdapter
+// para que falhas HTTP (401/403/404/timeout) sejam registradas explicitamente.
+citoAdapter.setLogger(app.log);
 
 async function bootstrap(): Promise<void> {
   // Plugin de WebSocket (baseado na lib `ws`) deve ser registrado antes das rotas.

@@ -183,6 +183,10 @@ export interface MatchDetailDto extends MatchCardDto {
   results?: MatchSeriesResultsDto;
   players_stats?: PostMatchPlayerStatDto[];
   preMatchStats?: PreMatchStatsDto;
+  // [UPDATE]: Identificadores alinhados entre BFF, Cito Sports e PandaScore para subscrição WS.
+  ws_match_id?: UUID;
+  cito_match_id?: string | null;
+  pandascore_match_id?: string | null;
 }
 
 // -----------------------------------------------------------------------------

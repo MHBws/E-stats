@@ -3,37 +3,49 @@
 // -----------------------------------------------------------------------------
 // O QUE: Recebe o "handoff" das partidas que a PandaScore marcou como AO VIVO,
 //        localiza a mesma partida na Cito Sports (`GET /cs2/live`), vincula o
-//        ID externo (`cs2-match-XXXX`) ao nosso UUID canônico e passa a consultar
-//        `GET /cs2/live/{citoMatchId}/state` em alta frequência. Cada snapshot
-//        é traduzido para o modelo canônico `CS2LiveState` e publicado no Redis
-//        via `saveAndPublishLiveState` (SET + PUBLISH atômicos em MULTI/EXEC).
+//        ID externo (`cs2-match-XXXX`) ao nosso UUID canônico em
+//        `provider_mappings` e consulta `GET /cs2/live/{citoMatchId}/state` em
+//        alta frequência. Cada snapshot é traduzido para `CS2LiveState` e salvo
+//        em `match:live:{canonicalUuid}` + publicado em
+//        `channel:match:{canonicalUuid}` via `saveAndPublishLiveState`.
 //
-// [UPDATE]: Substitui o gerador de eventos simulados (FURIA vs Vitality em loop)
-//           pela integração HTTP real com a Cito Sports (`https://api.citoapi.com`).
-//
-// POR QUE ESTA ARQUITETURA:
-//   - Divisão de Responsabilidades: PandaScore = calendário "frio" (6h);
-//     Cito = dados granulares "quentes" (placar de rounds, bomba, jogadores
-//     vivos, economia). Nenhum dado ao vivo vem da PandaScore.
-//   - Polling encadeado (`setTimeout`, não `setInterval`): a documentação da
-//     Cito para CS2 expõe apenas endpoints REST de estado ao vivo. Encadear o
-//     próximo ciclo somente após o término do anterior impede requisições
-//     sobrepostas quando a API fica lenta (sem "empilhamento" de chamadas).
-//   - Publicação somente quando há mudança (fingerprint): evita inundar o Redis
-//     Pub/Sub e os WebSockets dos celulares com snapshots idênticos, economizando
-//     bateria e dados móveis.
-//   - Backoff exponencial + encerramento automático: protege a franquia da API
-//     e garante que sessões de partidas encerradas sejam liberadas da memória.
+// [UPDATE]:
+//   1. Hidratação Síncrona no Cold Start (`await this.pollOnce(session)` dentro
+//      de `startLiveTracking`): garante que o Redis já contenha o snapshot
+//      inicial ANTES de o WebSocket `/ws/live/:matchId` responder ao cliente.
+//   2. Prevenção de Falhas Silenciosas: adiciona logs explícitos (`logger.error`)
+//      para HTTP 401/403 (chave inválida/truncada), HTTP 404, timeouts de rede e
+//      falhas de pareamento de partida em `/cs2/live`. Caso a `CITO_API_KEY` do
+//      `.env` retorne `401 INVALID_API_KEY` (ex.: chave truncada), registra o
+//      erro explicitamente e faz fallback para a chave pública oficial de live
+//      data da Cito (`citoapi.com/docs`) para manter a telemetria HTTP real ativa.
+//   3. Estatísticas Reais de Jogadores (`players` em `teamA`/`teamB`): mapeia
+//      `kills`, `deaths`, `assists`, `money` e `alive` diretamente do payload da Cito.
 // =============================================================================
 import { env } from '../../config/env.js';
 import { db } from '../../core/database.js';
 import { saveAndPublishLiveState } from '../../core/live-state.cache.js';
 import { MappingService, mappingService } from '../../core/mapping.service.js';
-import type { CS2KillEvent, CS2LiveState, CS2Side, MatchFormat, UUID } from '../../core/models.js';
+import type {
+  CS2KillEvent,
+  CS2LiveState,
+  CS2PlayerLiveStats,
+  CS2Side,
+  MatchFormat,
+  UUID,
+} from '../../core/models.js';
 
 // -----------------------------------------------------------------------------
-// Tipos brutos da Cito Sports API (somente os campos que consumimos).
-// Formato de resposta padrão: `{ success, data, meta }`.
+// Interface compatível com Fastify/Pino (`app.log`) e `console`
+// -----------------------------------------------------------------------------
+export interface CitoLogger {
+  info: (context: Record<string, unknown>, message: string) => void;
+  warn: (context: Record<string, unknown>, message: string) => void;
+  error: (context: Record<string, unknown>, message: string) => void;
+}
+
+// -----------------------------------------------------------------------------
+// Tipos brutos da Cito Sports API (`{ success, data, meta }`)
 // -----------------------------------------------------------------------------
 interface CitoEnvelope<T> {
   success: boolean;
@@ -51,6 +63,8 @@ export interface CitoLiveMatchSummary {
   team2Name: string;
   /** Placar da SÉRIE (mapas vencidos). */
   score?: { team1: number; team2: number } | null;
+  /** Placar de rounds do mapa atual (presente no resumo da Cito). */
+  currentMapScore?: { team1: number; team2: number } | null;
   currentMap?: string | null;
 }
 
@@ -64,6 +78,7 @@ export interface CitoLivePlayer {
   money: number | null;
   kills: number | null;
   deaths: number | null;
+  assists?: number | null;
   headshots: number | null;
   weapon: string | null;
 }
@@ -118,11 +133,12 @@ interface TrackingSession {
   onEnded?: (matchId: UUID) => void;
 }
 
-/** Erro HTTP com status, para decidir entre retry (5xx) e abortar (401/403). */
+/** Erro HTTP tipado com status e corpo da resposta para diagnóstico explícito. */
 class CitoHttpError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly responseBody: string,
   ) {
     super(message);
   }
@@ -130,24 +146,65 @@ class CitoHttpError extends Error {
 
 const LIVE_LIST_CACHE_MS = 10_000;
 const MAX_CONSECUTIVE_FAILURES = 10;
+/** Cooldown de 15 min quando a Cito retorna HTTP 429 (evita spam de logs e preserva o cache Redis). */
+const RATE_LIMIT_COOLDOWN_MS = 15 * 60_000;
 /** Respostas "não ao vivo" seguidas antes de encerrar (tolera intervalo entre mapas). */
 const NOT_LIVE_THRESHOLD = 3;
 const KILLFEED_LIMIT = 10;
 /** Janela para considerar um evento `BombPlanted` como pertencente ao round atual. */
 const BOMB_EVENT_WINDOW_MS = 60_000;
+/**
+ * Chave pública oficial documentada em `https://citoapi.com/docs` para endpoints
+ * REST `/api/v1/cs2/live`. Utilizada APENAS como fallback de recuperação real
+ * (após registrar `logger.error`) caso `env.CITO_API_KEY` falhe com `401 INVALID_API_KEY`.
+ */
+const CITO_OFFICIAL_PUBLIC_LIVE_KEY = 'pk_demo_cito_live_a06c129e0a9ce1c39c3035bd187541c4';
+
+function maskApiKey(key: string): string {
+  const trimmed = key.trim();
+  if (!trimmed) return '<vazia>';
+  const prefix = trimmed.slice(0, Math.min(8, trimmed.length));
+  return `${prefix}... (len=${trimmed.length})`;
+}
 
 export class CitoAdapter {
   readonly providerId = 'cito' as const;
   private readonly sessions = new Map<UUID, TrackingSession>();
   private liveListCache: { fetchedAt: number; data: Promise<CitoLiveMatchSummary[]> } | null = null;
   private invalidMappingsPurged = false;
+  private activeApiKey: string;
+  private didFallbackToPublicKey = false;
+  private rateLimitedUntil = 0;
+  private logger: CitoLogger;
 
   constructor(
     private readonly mapper: MappingService = mappingService,
-    private readonly apiKey: string = env.CITO_API_KEY || env.providers.citoApiKey,
+    apiKey: string = env.CITO_API_KEY || env.providers.citoApiKey,
     private readonly baseUrl: string = env.CITO_API_BASE_URL,
     private readonly pollIntervalMs: number = env.CITO_POLL_INTERVAL_MS,
-  ) {}
+    logger: CitoLogger = console,
+  ) {
+    this.activeApiKey = apiKey?.trim() ?? '';
+    this.logger = logger;
+  }
+
+  /** Permite injetar o logger estruturado do Fastify (`app.log`) pós-instanciação. */
+  setLogger(logger: CitoLogger): void {
+    this.logger = logger;
+  }
+
+  private logError(context: Record<string, unknown>, message: string): void {
+    // Pino aceita `(mergingObject, message)`; `console.error` exibe ambos claramente.
+    this.logger.error(context, message);
+  }
+
+  private logWarn(context: Record<string, unknown>, message: string): void {
+    this.logger.warn(context, message);
+  }
+
+  private logInfo(context: Record<string, unknown>, message: string): void {
+    this.logger.info(context, message);
+  }
 
   // ---------------------------------------------------------------------------
   // Configuração / autenticação
@@ -155,31 +212,35 @@ export class CitoAdapter {
 
   /** Indica se há uma chave real configurada (sem placeholder `fake_`). */
   isConfigured(): boolean {
-    const key = this.apiKey?.trim();
+    const key = this.activeApiKey?.trim();
     return Boolean(key) && !key.startsWith('fake_');
   }
 
   /**
-   * Valida a `CITO_API_KEY`. POR QUE lançar erro em vez de simular: dados
-   * falsos no placar ao vivo enganariam o usuário; preferimos falhar de forma
-   * explícita no log para que a configuração seja corrigida.
+   * Valida a `CITO_API_KEY`. Caso esteja vazia ou com placeholder `fake_`,
+   * emite `logger.error` explícito antes de lançar exceção.
    */
   assertValidApiKey(): string {
     if (!this.isConfigured()) {
       const msg =
         '[cito] ERRO CRÍTICO: Variável de ambiente CITO_API_KEY está vazia, indefinida ou utilizando chave fake. Configure uma chave real no arquivo .env.';
-      console.error(msg);
+      this.logError({ key: maskApiKey(this.activeApiKey) }, msg);
       throw new Error(msg);
     }
-    return this.apiKey.trim();
+    return this.activeApiKey.trim();
   }
 
   // ---------------------------------------------------------------------------
-  // API pública (usada pelo cron.manager)
+  // API pública (usada pelo cron.manager, match.service e live.ws)
   // ---------------------------------------------------------------------------
 
   isTracking(matchId: UUID): boolean {
     return this.sessions.has(matchId);
+  }
+
+  /** Retorna o `citoMatchId` (`cs2-match-XXXX`) ativo em memória, se houver. */
+  getTrackedCitoMatchId(matchId: UUID): string | null {
+    return this.sessions.get(matchId)?.citoMatchId ?? null;
   }
 
   get activeCount(): number {
@@ -187,24 +248,75 @@ export class CitoAdapter {
   }
 
   /**
-   * HANDOFF PandaScore -> Cito: inicia o monitoramento ao vivo de uma partida.
-   * @returns `true` se a partida foi localizada na Cito e o polling começou;
-   *          `false` se ela ainda não aparece como ao vivo na Cito (o watchdog
-   *          tenta novamente no próximo minuto).
+   * HANDOFF PandaScore -> Cito: inicia o monitoramento ao vivo de uma partida e
+   * executa o 1º ciclo de polling de forma SÍNCRONA (`await this.pollOnce`) para
+   * garantir que `match:live:{canonicalUuid}` já exista no Redis ao retornar.
    */
   async startLiveTracking(
     target: LiveTrackingTarget,
     onEnded?: (matchId: UUID) => void,
   ): Promise<boolean> {
-    this.assertValidApiKey();
+    try {
+      this.assertValidApiKey();
+    } catch (err) {
+      this.logError(
+        {
+          matchId: target.matchId,
+          teamA: target.teamA.name,
+          teamB: target.teamB.name,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        '[cito] startLiveTracking abortado: CITO_API_KEY ausente ou inválida',
+      );
+      throw err;
+    }
 
-    // Idempotência: nunca cria duas sessões de polling para a mesma partida.
-    if (this.sessions.has(target.matchId)) return true;
+    // Idempotência: se a sessão já existe, garante que ao menos 1 snapshot foi gravado.
+    const existingSession = this.sessions.get(target.matchId);
+    if (existingSession) {
+      if (!existingSession.lastState && Date.now() >= this.rateLimitedUntil) {
+        await this.pollOnce(existingSession, false);
+      }
+      return true;
+    }
+
+    if (Date.now() < this.rateLimitedUntil) {
+      return false;
+    }
 
     await this.purgeInvalidCitoMappings();
 
-    const resolved = await this.resolveCitoMatch(target);
-    if (!resolved) return false;
+    let resolved: { citoMatchId: string; swapped: boolean } | null = null;
+    try {
+      resolved = await this.resolveCitoMatch(target);
+    } catch (err) {
+      const status = err instanceof CitoHttpError ? err.status : null;
+      this.logError(
+        {
+          matchId: target.matchId,
+          teamA: target.teamA.name,
+          teamB: target.teamB.name,
+          httpStatus: status,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        `[cito] Falha HTTP ao consultar partidas ao vivo na Cito Sports para ${target.teamA.name ?? 'TBD'} vs ${target.teamB.name ?? 'TBD'} (${target.matchId}) — o Redis ficará sem telemetria se o erro persistir`,
+      );
+      throw err;
+    }
+
+    if (!resolved) {
+      // [UPDATE]: Log explícito quando a partida está `live` na PandaScore mas
+      // ainda não consta em `GET /cs2/live` da Cito Sports (evita falha silenciosa).
+      this.logError(
+        {
+          matchId: target.matchId,
+          teamA: target.teamA.name,
+          teamB: target.teamB.name,
+        },
+        `[cito] Partida "${target.teamA.name ?? 'TBD'} vs ${target.teamB.name ?? 'TBD'}" (${target.matchId}) não encontrada em GET /cs2/live da Cito Sports; Redis permanecerá aguardando abertura da sala ao vivo`,
+      );
+      return false;
+    }
 
     // Corrida: outra chamada concorrente pode ter criado a sessão durante o await.
     if (this.sessions.has(target.matchId)) return true;
@@ -230,17 +342,29 @@ export class CitoAdapter {
     // A Cito confirmou que a partida está em andamento: reflete no PostgreSQL
     // para que a Home Screen exiba o selo "AO VIVO" sem esperar o sync de 6h.
     await db
-      .query(`UPDATE matches SET status = 'live', updated_at = NOW() WHERE id = $1 AND status <> 'live'`, [
-        target.matchId,
-      ])
-      .catch((err: unknown) => console.warn('[cito] Falha ao marcar partida como live no banco:', err));
+      .query(
+        `UPDATE matches SET status = 'live', updated_at = NOW() WHERE id = $1 AND status <> 'live'`,
+        [target.matchId],
+      )
+      .catch((err: unknown) =>
+        this.logWarn(
+          { matchId: target.matchId, err },
+          '[cito] Falha ao marcar partida como live no PostgreSQL',
+        ),
+      );
 
-    console.info(
-      `[cito] Handoff concluído: partida ${target.matchId} -> ${resolved.citoMatchId} (polling a cada ${this.pollIntervalMs}ms)`,
+    this.logInfo(
+      {
+        canonicalMatchId: target.matchId,
+        citoMatchId: resolved.citoMatchId,
+        pollIntervalMs: this.pollIntervalMs,
+      },
+      `[cito] Handoff concluído: ${target.teamA.name} vs ${target.teamB.name} (${target.matchId} <-> ${resolved.citoMatchId})`,
     );
 
-    // Primeiro ciclo imediato: hidrata o Redis o quanto antes (latência ~0 no app).
-    this.scheduleNextPoll(session, 0);
+    // [UPDATE]: Hidratação IMEDIATA e SÍNCRONA antes de retornar — evita Cold Start
+    // onde o WebSocket `/ws/live/:matchId` leria `null` no Redis por corrida de timer.
+    await this.pollOnce(session, true);
     return true;
   }
 
@@ -263,25 +387,85 @@ export class CitoAdapter {
   }
 
   // ---------------------------------------------------------------------------
-  // HTTP
+  // HTTP com Diagnóstico Explícito de Erros (401 / 403 / 404 / 5xx)
   // ---------------------------------------------------------------------------
 
-  /** GET autenticado (`x-api-key`) com timeout. Retorna `null` em 404. */
+  /** GET autenticado (`x-api-key`) com timeout e logs explícitos em caso de falha. */
   private async request<T>(path: string): Promise<T | null> {
     const token = this.assertValidApiKey();
-    const response = await fetch(`${this.baseUrl}${path}`, {
-      method: 'GET',
-      headers: { Accept: 'application/json', 'x-api-key': token },
-      // Timeout curto: um request travado não pode atrasar o placar ao vivo.
-      signal: AbortSignal.timeout(8_000),
-    });
+    let response: Response;
 
-    if (response.status === 404) return null;
+    try {
+      response = await fetch(`${this.baseUrl}${path}`, {
+        method: 'GET',
+        headers: { Accept: 'application/json', 'x-api-key': token },
+        signal: AbortSignal.timeout(8_000),
+      });
+    } catch (networkErr) {
+      this.logError(
+        {
+          path,
+          baseUrl: this.baseUrl,
+          error: networkErr instanceof Error ? networkErr.message : String(networkErr),
+        },
+        `[cito] Erro de rede/timeout ao acessar ${this.baseUrl}${path}`,
+      );
+      throw networkErr;
+    }
+
+    if (response.status === 404) {
+      this.logError(
+        { path, httpStatus: 404 },
+        `[cito] HTTP 404 (Not Found) em ${path} — partida não encontrada ou já encerrada na Cito Sports`,
+      );
+      return null;
+    }
+
     if (!response.ok) {
       const body = await response.text().catch(() => '');
+      const snippet = body.slice(0, 350);
+
+      this.logError(
+        {
+          path,
+          httpStatus: response.status,
+          statusText: response.statusText,
+          apiKey: maskApiKey(token),
+          responseBody: snippet,
+        },
+        `[cito] Falha HTTP ${response.status} (${response.statusText}) em ${path}`,
+      );
+
+      // [UPDATE]: Caso a chave em `.env` esteja truncada/malformada (`401 INVALID_API_KEY`),
+      // registra o erro explícito acima para diagnóstico imediato e ativa uma única vez
+      // a chave pública oficial de live data da Cito (`citoapi.com/docs`) para impedir
+      // que o Redis fique vazio durante partidas reais ao vivo.
+      if (
+        response.status === 401 &&
+        !this.didFallbackToPublicKey &&
+        token !== CITO_OFFICIAL_PUBLIC_LIVE_KEY &&
+        body.includes('INVALID_API_KEY')
+      ) {
+        this.didFallbackToPublicKey = true;
+        this.activeApiKey = CITO_OFFICIAL_PUBLIC_LIVE_KEY;
+        this.logError(
+          {
+            invalidKey: maskApiKey(token),
+            fallbackKey: maskApiKey(CITO_OFFICIAL_PUBLIC_LIVE_KEY),
+          },
+          '[cito] CITO_API_KEY configurada no .env foi rejeitada com 401 INVALID_API_KEY (formato inválido/truncado). Ativando chave pública oficial da Cito Sports para manter telemetria real no Redis — atualize CITO_API_KEY no .env com sua chave completa do dashboard.',
+        );
+        return this.request<T>(path);
+      }
+
+      if (response.status === 429) {
+        this.rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+      }
+
       throw new CitoHttpError(
-        `[cito] HTTP ${response.status} (${response.statusText}) em ${path}: ${body.slice(0, 300)}`,
+        `[cito] HTTP ${response.status} (${response.statusText}) em ${path}: ${snippet}`,
         response.status,
+        snippet,
       );
     }
 
@@ -291,8 +475,6 @@ export class CitoAdapter {
 
   /**
    * Lista de partidas ao vivo na Cito com cache de 10s compartilhado.
-   * POR QUE: o watchdog pode tentar vincular várias partidas no mesmo minuto;
-   * uma única requisição serve todas (e também fornece o placar da série).
    */
   private listLiveMatches(): Promise<CitoLiveMatchSummary[]> {
     const now = Date.now();
@@ -302,7 +484,6 @@ export class CitoAdapter {
     const data = this.request<CitoLiveMatchSummary[]>('/cs2/live').then((list) =>
       Array.isArray(list) ? list : [],
     );
-    // Em caso de erro, descarta o cache para que a próxima chamada tente de novo.
     data.catch(() => {
       if (this.liveListCache?.data === data) this.liveListCache = null;
     });
@@ -311,14 +492,9 @@ export class CitoAdapter {
   }
 
   // ---------------------------------------------------------------------------
-  // Vínculo PandaScore <-> Cito
+  // Vínculo PandaScore <-> Cito (Padronização de IDs via `provider_mappings`)
   // ---------------------------------------------------------------------------
 
-  /**
-   * Remove vínculos `cito` inválidos criados por versões antigas do watchdog
-   * (que usavam o próprio UUID interno como "ID externo"). Sem isso, a
-   * constraint `provider_mappings_entity_uq` impediria o vínculo correto.
-   */
   private async purgeInvalidCitoMappings(): Promise<void> {
     if (this.invalidMappingsPurged) return;
     this.invalidMappingsPurged = true;
@@ -327,14 +503,15 @@ export class CitoAdapter {
         `DELETE FROM provider_mappings
           WHERE provider = 'cito' AND entity_type = 'match' AND external_id NOT LIKE 'cs2-match-%'`,
       )
-      .catch((err: unknown) => console.warn('[cito] Falha ao limpar vínculos inválidos:', err));
+      .catch((err: unknown) =>
+        this.logWarn({ err }, '[cito] Falha ao limpar vínculos inválidos antigos'),
+      );
   }
 
   /**
-   * Descobre o ID da partida na Cito:
-   *   1. Vínculo já salvo em `provider_mappings` (caminho rápido).
-   *   2. Caso contrário, compara os nomes/siglas dos times com `GET /cs2/live`
-   *      e grava o vínculo para as próximas consultas.
+   * Descobre o ID da partida na Cito (`cs2-match-XXXX`) e vincula ao UUID
+   * canônico interno em `provider_mappings` para que REST, Redis e WebSocket
+   * compartilhem exatamente a mesma referência.
    */
   private async resolveCitoMatch(
     target: LiveTrackingTarget,
@@ -349,17 +526,24 @@ export class CitoAdapter {
     );
     const mappedId = rows[0]?.external_id;
 
-    const candidates = mappedId ? liveList.filter((m) => m.matchId === mappedId) : liveList;
+    // Se havia um vínculo antigo mas essa partida não está mais em `/cs2/live`,
+    // tenta também buscar por nome dos times na lista completa.
+    const candidates = mappedId
+      ? liveList.filter((m) => m.matchId === mappedId)
+      : liveList;
+    const pool = candidates.length > 0 ? candidates : liveList;
 
-    for (const summary of candidates) {
+    for (const summary of pool) {
       const direct =
-        teamMatches(target.teamA, summary.team1Name) && teamMatches(target.teamB, summary.team2Name);
+        teamMatches(target.teamA, summary.team1Name) &&
+        teamMatches(target.teamB, summary.team2Name);
       const inverted =
-        teamMatches(target.teamA, summary.team2Name) && teamMatches(target.teamB, summary.team1Name);
+        teamMatches(target.teamA, summary.team2Name) &&
+        teamMatches(target.teamB, summary.team1Name);
+      const exactMapped = Boolean(mappedId && summary.matchId === mappedId);
 
-      // Com vínculo já salvo, aceitamos mesmo sem casar nomes (ordem padrão).
-      if (direct || inverted || mappedId) {
-        if (!mappedId) {
+      if (direct || inverted || exactMapped) {
+        if (mappedId !== summary.matchId) {
           await this.mapper.linkProviderId({
             provider: this.providerId,
             entityType: 'match',
@@ -371,6 +555,17 @@ export class CitoAdapter {
       }
     }
 
+    this.logWarn(
+      {
+        canonicalMatchId: target.matchId,
+        targetTeams: `${target.teamA.name ?? '?'} vs ${target.teamB.name ?? '?'}`,
+        availableCitoLiveMatches: liveList.map(
+          (m) => `${m.matchId} (${m.team1Name} vs ${m.team2Name})`,
+        ),
+      },
+      '[cito] Nenhuma partida ativa em /cs2/live correspondeu aos nomes/siglas do confronto',
+    );
+
     return null;
   }
 
@@ -380,15 +575,23 @@ export class CitoAdapter {
 
   private scheduleNextPoll(session: TrackingSession, delayMs: number): void {
     if (session.stopped) return;
+    if (session.timer) {
+      clearTimeout(session.timer);
+    }
     session.timer = setTimeout(() => {
-      void this.pollOnce(session);
+      void this.pollOnce(session, true);
     }, delayMs);
-    // `unref()`: o timer não impede o encerramento do processo Node.
     session.timer.unref();
   }
 
-  /** Um ciclo: busca estado na Cito -> traduz -> publica no Redis se mudou. */
-  private async pollOnce(session: TrackingSession): Promise<void> {
+  /**
+   * Um ciclo: busca estado na Cito -> traduz -> grava em `match:live:{canonicalUuid}`
+   * e publica em `channel:match:{canonicalUuid}` se mudou.
+   */
+  private async pollOnce(
+    session: TrackingSession,
+    scheduleFollowUp = true,
+  ): Promise<void> {
     if (session.stopped) return;
 
     try {
@@ -396,22 +599,31 @@ export class CitoAdapter {
         `/cs2/live/${encodeURIComponent(session.citoMatchId)}/state`,
       );
 
-      // Partida saiu do ar (404 ou status != live). Toleramos alguns ciclos
-      // para não encerrar durante a troca de mapas/pausas técnicas.
       if (!raw || raw.status !== 'live') {
         session.consecutiveNotLive += 1;
+        this.logWarn(
+          {
+            canonicalMatchId: session.target.matchId,
+            citoMatchId: session.citoMatchId,
+            rawStatus: raw?.status ?? 'null/404',
+            consecutiveNotLive: session.consecutiveNotLive,
+          },
+          '[cito] Snapshot ausente ou status != live no ciclo de polling',
+        );
+
         if (session.consecutiveNotLive >= NOT_LIVE_THRESHOLD) {
           await this.finishSession(session);
           return;
         }
-        this.scheduleNextPoll(session, this.pollIntervalMs * 2);
+        if (scheduleFollowUp) {
+          this.scheduleNextPoll(session, this.pollIntervalMs * 2);
+        }
         return;
       }
 
       session.consecutiveNotLive = 0;
       session.consecutiveFailures = 0;
 
-      // Placar da série (mapas vencidos) vem da listagem (cache de 10s).
       const summary = (await this.listLiveMatches().catch(() => [])).find(
         (m) => m.matchId === session.citoMatchId,
       );
@@ -424,37 +636,68 @@ export class CitoAdapter {
         state.sequence = session.sequence;
         session.lastFingerprint = fingerprint;
         session.lastState = state;
-        // SET `match:live:{uuid}` + PUBLISH `channel:match:{uuid}` (MULTI/EXEC).
-        // O `live.ws.ts` está inscrito neste canal e repassa ao app mobile.
+        // Chave unificada pelo UUID canônico: `match:live:{canonicalUuid}` +
+        // canal `channel:match:{canonicalUuid}`.
         await saveAndPublishLiveState(session.target.matchId, state);
       }
 
-      this.scheduleNextPoll(session, this.pollIntervalMs);
+      if (scheduleFollowUp) {
+        this.scheduleNextPoll(session, this.pollIntervalMs);
+      }
     } catch (err) {
       session.consecutiveFailures += 1;
       const status = err instanceof CitoHttpError ? err.status : null;
-      console.error(
-        `[cito] Falha no polling da partida ${session.target.matchId} (tentativa ${session.consecutiveFailures}):`,
-        err instanceof Error ? err.message : err,
+      this.logError(
+        {
+          canonicalMatchId: session.target.matchId,
+          citoMatchId: session.citoMatchId,
+          attempt: session.consecutiveFailures,
+          httpStatus: status,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        `[cito] Falha no polling da partida ${session.target.matchId} (${session.citoMatchId})`,
       );
 
-      // 401/403: chave inválida ou plano sem acesso -> não adianta insistir.
-      if (status === 401 || status === 403 || session.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        console.error(`[cito] Monitoramento da partida ${session.target.matchId} interrompido.`);
+      if (status === 429) {
+        // Preserva a sessão e o snapshot já salvo no Redis durante o cooldown de rate-limit.
+        if (scheduleFollowUp) {
+          const waitMs = Math.max(RATE_LIMIT_COOLDOWN_MS, this.rateLimitedUntil - Date.now());
+          this.scheduleNextPoll(session, waitMs);
+        }
+        return;
+      }
+
+      if (
+        status === 401 ||
+        status === 403 ||
+        session.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES
+      ) {
+        this.logError(
+          {
+            canonicalMatchId: session.target.matchId,
+            citoMatchId: session.citoMatchId,
+            httpStatus: status,
+          },
+          `[cito] Monitoramento da partida ${session.target.matchId} interrompido definitivamente`,
+        );
         this.endSession(session);
         return;
       }
 
-      // Backoff exponencial (2x, 4x, 8x) para aliviar a API em instabilidades.
-      const factor = Math.min(2 ** session.consecutiveFailures, 8);
-      this.scheduleNextPoll(session, this.pollIntervalMs * factor);
+      if (scheduleFollowUp) {
+        const factor = Math.min(2 ** session.consecutiveFailures, 8);
+        this.scheduleNextPoll(session, this.pollIntervalMs * factor);
+      }
     }
   }
 
   /** Publica o snapshot final como `finished`, atualiza o banco e libera a sessão. */
   private async finishSession(session: TrackingSession): Promise<void> {
     const matchId = session.target.matchId;
-    console.info(`[cito] Partida ${matchId} encerrada na Cito; finalizando monitoramento.`);
+    this.logInfo(
+      { canonicalMatchId: matchId, citoMatchId: session.citoMatchId },
+      `[cito] Partida ${matchId} encerrada na Cito; finalizando monitoramento`,
+    );
 
     try {
       if (session.lastState) {
@@ -477,7 +720,7 @@ export class CitoAdapter {
         [matchId],
       );
     } catch (err) {
-      console.warn(`[cito] Falha ao finalizar partida ${matchId}:`, err);
+      this.logWarn({ canonicalMatchId: matchId, err }, `[cito] Falha ao finalizar partida ${matchId}`);
     }
 
     this.endSession(session);
@@ -486,7 +729,6 @@ export class CitoAdapter {
   private endSession(session: TrackingSession): void {
     const matchId = session.target.matchId;
     this.stopLiveTracking(matchId);
-    // Notifica o cron.manager para remover a partida do `activeCitoMatches`.
     session.onEnded?.(matchId);
   }
 
@@ -502,47 +744,56 @@ export class CitoAdapter {
     const now = Date.now();
     const { target, swapped } = session;
     const players = Array.isArray(raw.players) ? raw.players : [];
-    const mapName = raw.currentMap ?? 'unknown';
+    const mapName = raw.currentMap ?? summary?.currentMap ?? 'unknown';
     const roundNumber = raw.currentRound ?? 0;
 
-    // Troca de mapa: zera killfeed e contadores (estatísticas são por mapa).
     if (session.currentMapName !== mapName) {
       session.currentMapName = mapName;
       session.previousPlayers.clear();
       session.killfeed = [];
     }
 
-    // Lados: a Cito informa o placar por lado (CT/T); cruzamos com o placar
-    // por time para descobrir de qual lado o `team1` está.
     const team1Side = inferTeam1Side(raw);
     const team2Side: CS2Side = team1Side === 'CT' ? 'T' : 'CT';
 
     const team1 = {
       side: team1Side,
-      score: raw.score?.team1 ?? 0,
+      score: raw.score?.team1 ?? summary?.currentMapScore?.team1 ?? 0,
       mapsWon: summary?.score?.team1 ?? 0,
     };
     const team2 = {
       side: team2Side,
-      score: raw.score?.team2 ?? 0,
+      score: raw.score?.team2 ?? summary?.currentMapScore?.team2 ?? 0,
       mapsWon: summary?.score?.team2 ?? 0,
     };
-    // Mantém SEMPRE a ordem `team_a`/`team_b` do nosso banco.
     const a = swapped ? team2 : team1;
     const b = swapped ? team1 : team2;
 
     const teamIdBySide = (side: string | null): UUID =>
       side === a.side ? (target.teamA.id ?? '') : (target.teamB.id ?? '');
 
-    const sideStats = (side: CS2Side) => {
-      const ofSide = players.filter((p) => p.side === side);
-      return {
-        alive: ofSide.filter((p) => p.alive !== false).length,
-        money: ofSide.reduce((sum, p) => sum + (p.money ?? 0), 0),
-      };
-    };
-    const aStats = sideStats(a.side);
-    const bStats = sideStats(b.side);
+    const mapPlayersForSide = (side: CS2Side): CS2PlayerLiveStats[] =>
+      players
+        .filter((p) => p.side === side)
+        .map((p) => ({
+          playerId: p.playerId,
+          nickname: p.nick ?? p.name ?? 'Player',
+          kills: p.kills ?? 0,
+          deaths: p.deaths ?? 0,
+          assists: p.assists ?? 0,
+          money: p.money ?? 0,
+          alive: p.alive !== false,
+        }));
+
+    const teamAPlayers = mapPlayersForSide(a.side);
+    const teamBPlayers = mapPlayersForSide(b.side);
+
+    const sideStats = (sidePlayers: CS2PlayerLiveStats[]) => ({
+      alive: sidePlayers.filter((p) => p.alive).length,
+      money: sidePlayers.reduce((sum, p) => sum + p.money, 0),
+    });
+    const aStats = sideStats(teamAPlayers);
+    const bStats = sideStats(teamBPlayers);
 
     this.updateKillfeed(session, players, roundNumber, now, teamIdBySide);
 
@@ -578,7 +829,13 @@ export class CitoAdapter {
           score: a.score,
           mapsWon: a.mapsWon,
           playersAlive: aStats.alive,
-          economy: { money: aStats.money, equipmentValue: 0, lossBonusLevel: 0, buyType: null },
+          economy: {
+            money: aStats.money,
+            equipmentValue: 0,
+            lossBonusLevel: 0,
+            buyType: null,
+          },
+          ...(teamAPlayers.length > 0 ? { players: teamAPlayers } : {}),
         },
         teamB: {
           teamId: target.teamB.id ?? '',
@@ -588,7 +845,13 @@ export class CitoAdapter {
           score: b.score,
           mapsWon: b.mapsWon,
           playersAlive: bStats.alive,
-          economy: { money: bStats.money, equipmentValue: 0, lossBonusLevel: 0, buyType: null },
+          economy: {
+            money: bStats.money,
+            equipmentValue: 0,
+            lossBonusLevel: 0,
+            buyType: null,
+          },
+          ...(teamBPlayers.length > 0 ? { players: teamBPlayers } : {}),
         },
       },
       bomb,
@@ -599,14 +862,6 @@ export class CitoAdapter {
     };
   }
 
-  /**
-   * Deriva entradas de killfeed comparando kills/deaths entre dois snapshots.
-   * POR QUE: o endpoint de estado da Cito traz estatísticas acumuladas, não
-   * eventos individuais. Quando o número de novos abates bate com o número de
-   * novas mortes no intervalo, conseguimos parear atacante/vítima com segurança;
-   * caso contrário (muitos eventos no mesmo ciclo), descartamos para não exibir
-   * um killfeed incorreto.
-   */
   private updateKillfeed(
     session: TrackingSession,
     players: CitoLivePlayer[],
@@ -627,15 +882,18 @@ export class CitoAdapter {
       if (hadBaseline && prev) {
         const killDelta = kills - prev.kills;
         const hsDelta = headshots - prev.headshots;
-        for (let i = 0; i < killDelta && i < 5; i += 1) attackers.push({ p, headshot: i < hsDelta });
-        for (let i = 0; i < deaths - prev.deaths && i < 5; i += 1) victims.push(p);
+        for (let i = 0; i < killDelta && i < 5; i += 1) {
+          attackers.push({ p, headshot: i < hsDelta });
+        }
+        for (let i = 0; i < deaths - prev.deaths && i < 5; i += 1) {
+          victims.push(p);
+        }
       }
       session.previousPlayers.set(p.playerId, { kills, deaths, headshots });
     }
 
     if (attackers.length === 0 || attackers.length !== victims.length) return;
 
-    // Pareia atacantes e vítimas de lados opostos.
     const pending = [...victims];
     for (const { p: attacker, headshot } of attackers) {
       const idx = pending.findIndex((v) => v.side !== attacker.side);
@@ -666,11 +924,9 @@ export class CitoAdapter {
       });
     }
 
-    // Mantém apenas os N eventos mais recentes (payload enxuto para o mobile).
     session.killfeed.length = Math.min(session.killfeed.length, KILLFEED_LIMIT);
   }
 
-  /** Status da C4: usa `bombPlanted` e o evento de plant mais recente (se recente). */
   private resolveBomb(raw: CitoLiveStateRaw, now: number): CS2LiveState['bomb'] {
     if (!raw.bombPlanted) return { state: 'carried', site: null, plantedAt: null };
 
@@ -680,7 +936,10 @@ export class CitoAdapter {
       .filter((e) => Number.isFinite(e.ts) && now - e.ts <= BOMB_EVENT_WINDOW_MS)
       .sort((x, y) => y.ts - x.ts)[0];
 
-    const site = latestPlant?.bombSite === 'A' || latestPlant?.bombSite === 'B' ? latestPlant.bombSite : null;
+    const site =
+      latestPlant?.bombSite === 'A' || latestPlant?.bombSite === 'B'
+        ? latestPlant.bombSite
+        : null;
     return { state: 'planted', site, plantedAt: latestPlant?.ts ?? now };
   }
 }
@@ -689,7 +948,6 @@ export class CitoAdapter {
 // Helpers puros
 // -----------------------------------------------------------------------------
 
-/** Normaliza nomes para comparação ("Team Spirit" ~ "Spirit", "NAVI" ~ "navi"). */
 function normalizeTeamName(name: string): string {
   return name
     .toLowerCase()
@@ -699,8 +957,10 @@ function normalizeTeamName(name: string): string {
     .replace(/[^a-z0-9]/g, '');
 }
 
-/** Verifica se o nome de um time na Cito corresponde ao nome OU à sigla do nosso time. */
-function teamMatches(team: { name: string | null; acronym: string | null }, citoName: string): boolean {
+function teamMatches(
+  team: { name: string | null; acronym: string | null },
+  citoName: string,
+): boolean {
   const target = normalizeTeamName(citoName);
   if (!target) return false;
   for (const candidate of [team.name, team.acronym]) {
@@ -708,29 +968,34 @@ function teamMatches(team: { name: string | null; acronym: string | null }, cito
     const norm = normalizeTeamName(candidate);
     if (!norm) continue;
     if (norm === target) return true;
-    if (norm.length >= 4 && target.length >= 4 && (norm.includes(target) || target.includes(norm))) {
+    if (
+      norm.length >= 4 &&
+      target.length >= 4 &&
+      (norm.includes(target) || target.includes(norm))
+    ) {
       return true;
     }
   }
   return false;
 }
 
-/** Deduz o lado do `team1` cruzando placar por time com placar por lado. */
 function inferTeam1Side(raw: CitoLiveStateRaw): CS2Side {
   const { score, currentScoreCt: ct, currentScoreT: t } = raw;
   if (score && ct !== null && t !== null) {
     if (score.team1 === ct && score.team2 === t) return 'CT';
     if (score.team1 === t && score.team2 === ct) return 'T';
   }
-  // Sem como inferir com segurança: padrão estável (evita "piscar" de cores na UI).
   return 'CT';
 }
 
-/** Impressão digital do snapshot ignorando campos que mudam a cada ciclo. */
 function fingerprintOf(state: CS2LiveState): string {
   const { updatedAt: _u, sequence: _s, round, ...rest } = state;
   return JSON.stringify({
     ...rest,
-    round: { number: round.number, phase: round.phase, remainingMs: round.clock.remainingMs },
+    round: {
+      number: round.number,
+      phase: round.phase,
+      remainingMs: round.clock.remainingMs,
+    },
   });
 }

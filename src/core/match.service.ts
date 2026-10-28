@@ -33,9 +33,12 @@ import {
   type PandaScoreRosterPlayer,
   type PreMatchStatsDto,
 } from '../providers/pandascore/pandascore.adapter.js';
-// [UPDATE]: Aciona handoff imediato para a Cito Sports quando o Smart Polling
-// detecta que uma partida agendada acabou de entrar ao vivo (`status === 'live'`).
-import { handoffLiveMatchesToCito } from '../workers/cron.manager.js';
+// [UPDATE]: Aciona handoff imediato e hidratação sob demanda na Cito Sports
+// quando uma partida está `live`, alinhando os IDs entre REST, Redis e WebSocket.
+import {
+  ensureLiveMatchHydrated,
+  handoffLiveMatchesToCito,
+} from '../workers/cron.manager.js';
 
 /** Abas estilo Apple Sports suportadas pelo filtro de listagem. */
 export type MatchTabFilter = 'yesterday' | 'today' | 'upcoming';
@@ -108,6 +111,11 @@ export interface MatchDetailDto extends MatchCardDto {
   results: MatchSeriesResultsDto;
   players_stats: PandaScorePostMatchPlayerStat[];
   preMatchStats: PreMatchStatsDto;
+  // [UPDATE]: Mapeamento explícito de IDs para subscrição WebSocket sem conflito
+  // entre UUID canônico, Cito Sports (`cs2-match-XXXX`) e PandaScore (inteiro).
+  ws_match_id: UUID;
+  cito_match_id: string | null;
+  pandascore_match_id: string | null;
 }
 
 /** Linha bruta retornada pelo JOIN de `getMatches`. */
@@ -452,9 +460,15 @@ export class MatchService {
         }
       : null;
 
-    // [UPDATE]: Dispara simultaneamente (`Promise.all`) a busca de rosters/stats e
-    // o enriquecimento relacional `preMatchStats` (H2H, Form, Standings e Streams).
-    const [{ teamAPlayers, teamBPlayers, playersStats }, preMatchStats] = await Promise.all([
+    // [UPDATE]: Dispara simultaneamente (`Promise.all`) a busca de rosters/stats,
+    // o enriquecimento relacional `preMatchStats` e (para partidas `live`) a
+    // hidratação sob demanda na Cito Sports (`ensureLiveMatchHydrated`) para que
+    // o Redis já contenha `CS2LiveState` antes da conexão WebSocket do cliente.
+    const [
+      { teamAPlayers, teamBPlayers, playersStats },
+      preMatchStats,
+      hydratedCitoId,
+    ] = await Promise.all([
       this.pandaAdapter.fetchMatchRostersAndStats({
         matchId: baseCard.id,
         status: baseCard.status,
@@ -469,7 +483,31 @@ export class MatchService {
         teamA: teamARef,
         teamB: teamBRef,
       }),
+      baseCard.status === 'live'
+        ? ensureLiveMatchHydrated(baseCard.id)
+        : Promise.resolve<string | null>(null),
     ]);
+
+    // [UPDATE]: Consulta `provider_mappings` após a hidratação para expor
+    // `cito_match_id`, `pandascore_match_id` e `ws_match_id` no payload REST.
+    const providerMappingsResult = await this.pool.query<{
+      provider: string;
+      external_id: string;
+    }>(
+      `SELECT provider, external_id
+         FROM provider_mappings
+        WHERE entity_type = 'match'
+          AND entity_id = $1`,
+      [baseCard.id],
+    );
+
+    const citoMatchId =
+      hydratedCitoId ??
+      providerMappingsResult.rows.find((r) => r.provider === 'cito')?.external_id ??
+      null;
+    const pandascoreMatchId =
+      providerMappingsResult.rows.find((r) => r.provider === 'pandascore')?.external_id ??
+      null;
 
     return {
       ...baseCard,
@@ -489,6 +527,9 @@ export class MatchService {
       results,
       players_stats: playersStats,
       preMatchStats,
+      ws_match_id: baseCard.id,
+      cito_match_id: citoMatchId,
+      pandascore_match_id: pandascoreMatchId,
     };
   }
 }

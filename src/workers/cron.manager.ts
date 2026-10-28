@@ -65,6 +65,14 @@ export const activeCitoMatches = new Set<string>();
 /** Lista interna das tasks agendadas no `node-cron` para parada limpa no shutdown. */
 const scheduledTasks: ScheduledTask[] = [];
 
+/**
+ * [UPDATE]: Deduplicação de hidratações concorrentes sob demanda (Cold Start).
+ * POR QUE: Quando `GET /api/matches/:id` e `WS /ws/live/:id` chegam quase juntos
+ * para uma partida recém-iniciada, ambos aguardam a MESMA Promise de handoff na
+ * Cito Sports sem duplicar requisições HTTP nem ler `null` no Redis antes do fim.
+ */
+const hydrationInFlight = new Map<UUID, Promise<string | null>>();
+
 // Instâncias padrão reutilizadas pelos workers (permitem injeção caso necessário).
 const defaultMapper = new MappingService();
 // [UPDATE]: Instâncias "ativas" — quando o `server.ts` registra seus adapters nos
@@ -167,6 +175,68 @@ export async function handoffLiveMatchesToCito(
     [matchIds],
   );
   return startTrackingTargets(rows.map(toTrackingTarget), citoAdapter, 'handoff');
+}
+
+/**
+ * [UPDATE]: Garante sob demanda (Cold Start) que uma partida `live` esteja
+ * vinculada na Cito Sports (`provider_mappings`) e com snapshot inicial salvo
+ * em `match:live:{matchId}` no Redis, retornando o `cito_match_id` (`cs2-match-XXXX`).
+ */
+export async function ensureLiveMatchHydrated(
+  matchId: UUID,
+  citoAdapter: CitoAdapter = activeCitoAdapter,
+): Promise<string | null> {
+  // Caminho rápido O(1) em RAM quando a partida já está sendo monitorada.
+  const trackedId = citoAdapter.getTrackedCitoMatchId(matchId);
+  if (trackedId) {
+    return trackedId;
+  }
+
+  const existingPromise = hydrationInFlight.get(matchId);
+  if (existingPromise) {
+    return existingPromise;
+  }
+
+  const task = (async (): Promise<string | null> => {
+    try {
+      // Só aciona handoff na Cito se a partida realmente constar como `live` no banco.
+      const { rows: liveCheck } = await db.query<{ id: UUID }>(
+        `SELECT id FROM matches WHERE id = $1 AND status = 'live' LIMIT 1`,
+        [matchId],
+      );
+
+      if (liveCheck.length > 0 && !citoAdapter.isTracking(matchId)) {
+        await handoffLiveMatchesToCito([matchId], citoAdapter);
+      }
+
+      const inMemoryId = citoAdapter.getTrackedCitoMatchId(matchId);
+      if (inMemoryId) {
+        return inMemoryId;
+      }
+
+      const { rows: mappingRows } = await db.query<{ external_id: string }>(
+        `SELECT external_id
+           FROM provider_mappings
+          WHERE provider = 'cito'
+            AND entity_type = 'match'
+            AND entity_id = $1
+          LIMIT 1`,
+        [matchId],
+      );
+      return mappingRows[0]?.external_id ?? null;
+    } catch (err) {
+      console.error(
+        `[cron:hydrate] Falha ao hidratar telemetria da partida ${matchId}:`,
+        err instanceof Error ? err.message : err,
+      );
+      return null;
+    } finally {
+      hydrationInFlight.delete(matchId);
+    }
+  })();
+
+  hydrationInFlight.set(matchId, task);
+  return task;
 }
 
 /**

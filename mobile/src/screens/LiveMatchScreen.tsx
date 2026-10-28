@@ -333,7 +333,8 @@ const LiveScoreboard = memo(function LiveScoreboard({
         <View style={styles.emptyStateCard}>
           <Text style={styles.emptyTitle}>Aguardando telemetria ao vivo da partida</Text>
           <Text style={styles.emptySubtitle}>
-            {wsError ?? `${matchDetail.team_a?.name ?? 'Equipe A'} vs ${matchDetail.team_b?.name ?? 'Equipe B'} (${matchId})`}
+            {wsError ??
+              `${matchDetail.team_a?.name ?? 'Equipe A'} vs ${matchDetail.team_b?.name ?? 'Equipe B'} · ${matchDetail.tournament.name}${matchDetail.cito_match_id ? ` (${matchDetail.cito_match_id})` : ''}`}
           </Text>
         </View>
       ) : (
@@ -491,7 +492,8 @@ export function LiveMatchScreen({ route }: LiveMatchScreenProps): React.JSX.Elem
             if (
               prev.status !== freshDetail.status ||
               prev.scheduled_at !== freshDetail.scheduled_at ||
-              prev.winner_id !== freshDetail.winner_id
+              prev.winner_id !== freshDetail.winner_id ||
+              prev.cito_match_id !== freshDetail.cito_match_id
             ) {
               return freshDetail;
             }
@@ -513,11 +515,13 @@ export function LiveMatchScreen({ route }: LiveMatchScreenProps): React.JSX.Elem
     };
   }, [matchId, shouldPollPreMatch]);
 
-  // [UPDATE]: O WebSocket SÓ é instanciado e consumido quando `match.status === 'live'`.
+  // [UPDATE]: O WebSocket SÓ é instanciado quando `match.status === 'live'` e
+  // prioriza `ws_match_id` / `cito_match_id` retornados pelo BFF para subscrição alinhada.
   const isLiveMatch = matchDetail?.status === 'live';
-  const { liveState, isConnected, error: wsError } = useLiveMatch(
-    isLiveMatch ? matchId : null,
-  );
+  const liveSubscriptionId = isLiveMatch
+    ? (matchDetail.ws_match_id ?? matchDetail.cito_match_id ?? matchDetail.id)
+    : null;
+  const { liveState, isConnected, error: wsError } = useLiveMatch(liveSubscriptionId);
 
   if (loadingDetail) {
     return (

@@ -19,12 +19,51 @@
 // =============================================================================
 import type { FastifyInstance } from 'fastify';
 import type { WebSocket } from 'ws';
+// [UPDATE]: Importa `db` para tradução de IDs externos (`provider_mappings`) e
+// `ensureLiveMatchHydrated` para hidratação sob demanda no Cold Start do WS.
+import { db } from '../core/database.js';
 // [UPDATE]: Módulo 4 — Importa cache de estado ao vivo e cliente Redis Pub/Sub.
 import { getLiveMatchState, matchChannel } from '../core/live-state.cache.js';
 import { redisSubscriber } from '../core/redis.js';
+import { ensureLiveMatchHydrated } from '../workers/cron.manager.js';
 
 // [UPDATE]: Módulo 4 — Intervalo de 30s para o Heartbeat (Ping/Pong).
 export const HEARTBEAT_INTERVAL_MS = 30_000;
+
+const UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * [UPDATE]: Normaliza qualquer formato de ID recebido em `/ws/live/:matchId`
+ * (UUID canônico interno, `cs2-match-XXXX` da Cito Sports ou inteiro da PandaScore)
+ * para o UUID canônico usado nas chaves `match:live:{uuid}` e `channel:match:{uuid}`.
+ * POR QUE: Elimina conflitos de subscrição entre Frontend, PandaScore e Cito Sports.
+ */
+async function resolveCanonicalMatchId(rawMatchId: string): Promise<string> {
+  const trimmed = rawMatchId.trim();
+  if (UUID_REGEX.test(trimmed)) {
+    return trimmed.toLowerCase();
+  }
+
+  try {
+    const { rows } = await db.query<{ entity_id: string }>(
+      `SELECT entity_id
+         FROM provider_mappings
+        WHERE entity_type = 'match'
+          AND external_id = $1
+        ORDER BY CASE provider WHEN 'cito' THEN 0 ELSE 1 END ASC
+        LIMIT 1`,
+      [trimmed],
+    );
+    if (rows[0]?.entity_id) {
+      return rows[0].entity_id;
+    }
+  } catch {
+    // Em caso de falha transitória no banco, preserva o ID original informado.
+  }
+
+  return trimmed;
+}
 
 /** Metadados de cada conexão ativa para controle de Heartbeat e limpeza. */
 interface TrackedClient {
@@ -72,33 +111,34 @@ export async function liveWsRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // [UPDATE]: Módulo 4 — Rota parametrizada `/ws/live/:matchId` para assinar uma
-  // partida específica de CS2.
+  // partida específica de CS2 (aceitando UUID canônico, Cito ID ou PandaScore ID).
   app.get<{ Params: { matchId: string } }>(
     '/ws/live/:matchId',
     { websocket: true },
     async (socket, request) => {
-      const { matchId } = request.params;
-      const channel = matchChannel(matchId);
+      const rawMatchId = request.params.matchId;
+      let canonicalMatchId = rawMatchId;
+      let subscribedChannel: string | null = null;
 
-      app.log.debug({ ip: request.ip, matchId }, '[ws] Cliente conectado à partida');
+      app.log.debug({ ip: request.ip, rawMatchId }, '[ws] Cliente conectado à partida');
 
       // -----------------------------------------------------------------------
       // Callback disparado pelo Redis Pub/Sub sempre que a partida sofre update.
-      // POR QUE buscamos `getLiveMatchState(matchId)` do Redis: O canal Pub/Sub
-      // trafega um aviso leve (`LiveUpdateNotice`), mantendo o cache Redis como
-      // fonte única da verdade e garantindo que o cliente sempre receba o
+      // POR QUE buscamos `getLiveMatchState(canonicalMatchId)` do Redis: O canal
+      // Pub/Sub trafega um aviso leve (`LiveUpdateNotice`), mantendo o cache Redis
+      // como fonte única da verdade e garantindo que o cliente sempre receba o
       // snapshot completo mais recente (`CS2LiveState`).
       // -----------------------------------------------------------------------
       const onRedisMessage = async (rawMessage: string): Promise<void> => {
         if (socket.readyState !== socket.OPEN) return;
 
         try {
-          const latestState = await getLiveMatchState(matchId);
+          const latestState = await getLiveMatchState(canonicalMatchId);
           if (latestState && socket.readyState === socket.OPEN) {
             socket.send(
               JSON.stringify({
                 type: 'match:state',
-                matchId,
+                matchId: canonicalMatchId,
                 data: latestState,
                 timestamp: Date.now(),
               }),
@@ -112,14 +152,17 @@ export async function liveWsRoutes(app: FastifyInstance): Promise<void> {
             socket.send(
               JSON.stringify({
                 type: 'match:state',
-                matchId,
+                matchId: canonicalMatchId,
                 data: parsed,
                 timestamp: Date.now(),
               }),
             );
           }
         } catch (err) {
-          app.log.error({ err, matchId }, '[ws] Erro ao repassar atualização do Redis ao cliente');
+          app.log.error(
+            { err, matchId: canonicalMatchId },
+            '[ws] Erro ao repassar atualização do Redis ao cliente',
+          );
         }
       };
 
@@ -139,17 +182,20 @@ export async function liveWsRoutes(app: FastifyInstance): Promise<void> {
         trackedClients.delete(clientRecord);
 
         try {
-          if (redisSubscriber.isOpen) {
-            await redisSubscriber.unsubscribe(channel, onRedisMessage);
+          if (subscribedChannel && redisSubscriber.isOpen) {
+            await redisSubscriber.unsubscribe(subscribedChannel, onRedisMessage);
           }
         } catch (err) {
-          app.log.error({ err, channel }, '[ws] Erro ao fazer unsubscribe no Redis');
+          app.log.error(
+            { err, channel: subscribedChannel },
+            '[ws] Erro ao fazer unsubscribe no Redis',
+          );
         }
       };
 
       const clientRecord: TrackedClient = {
         socket,
-        matchId,
+        matchId: canonicalMatchId,
         isAlive: true,
         cleanup,
       };
@@ -177,29 +223,51 @@ export async function liveWsRoutes(app: FastifyInstance): Promise<void> {
 
       // AÇÃO AO DESCONECTAR: remove listener do Redis Pub/Sub para evitar memory leak.
       socket.on('close', () => {
-        app.log.debug({ matchId }, '[ws] Cliente desconectado; limpando inscrição Pub/Sub');
+        app.log.debug(
+          { matchId: canonicalMatchId },
+          '[ws] Cliente desconectado; limpando inscrição Pub/Sub',
+        );
         void cleanup();
       });
 
       socket.on('error', (err) => {
-        app.log.warn({ err, matchId }, '[ws] Erro no socket do cliente; limpando recursos');
+        app.log.warn(
+          { err, matchId: canonicalMatchId },
+          '[ws] Erro no socket do cliente; limpando recursos',
+        );
         void cleanup();
       });
 
       // -----------------------------------------------------------------------
-      // AÇÕES AO CONECTAR:
-      //   a) Busca o estado atual no Redis (`getLiveMatchState`) e envia
-      //      imediatamente para hidratar a UI sem tela de espera.
-      //   b) Inscreve a conexão no canal `channel:match:{matchId}` via
-      //      `redisSubscriber` para receber atualizações em tempo real.
+      // [UPDATE]: COLD START & CACHE INICIAL (ANTES DO SUBSCRIBE):
+      //   1. Traduz `:matchId` (UUID, `cs2-match-XXXX` ou ID PandaScore) para o
+      //      UUID canônico da partida.
+      //   2. Lê imediatamente `GET match:live:{canonicalMatchId}` no Redis.
+      //   3. Se o cache estiver vazio para uma partida `live` (Cold Start),
+      //      aciona `ensureLiveMatchHydrated` para buscar o snapshot inicial na
+      //      Cito Sports e re-lê o Redis.
+      //   4. Se existir `CS2LiveState`, envia IMEDIATAMENTE via `socket.send`
+      //      para hidratar o `<LiveScoreboard />` sem tela de espera.
+      //   5. SÓ DEPOIS ativa `redisSubscriber.subscribe(channel, onRedisMessage)`
+      //      com verificação pós-subscrição contra corrida de eventos.
       // -----------------------------------------------------------------------
       try {
-        const initialState = await getLiveMatchState(matchId);
-        if (socket.readyState === socket.OPEN) {
+        canonicalMatchId = await resolveCanonicalMatchId(rawMatchId);
+        clientRecord.matchId = canonicalMatchId;
+        const channel = matchChannel(canonicalMatchId);
+
+        let initialState = await getLiveMatchState(canonicalMatchId);
+
+        if (initialState === null && UUID_REGEX.test(canonicalMatchId)) {
+          await ensureLiveMatchHydrated(canonicalMatchId);
+          initialState = await getLiveMatchState(canonicalMatchId);
+        }
+
+        if (initialState !== null && !cleanedUp && socket.readyState === socket.OPEN) {
           socket.send(
             JSON.stringify({
               type: 'match:state',
-              matchId,
+              matchId: canonicalMatchId,
               data: initialState,
               timestamp: Date.now(),
             }),
@@ -207,10 +275,32 @@ export async function liveWsRoutes(app: FastifyInstance): Promise<void> {
         }
 
         if (!cleanedUp && socket.readyState === socket.OPEN) {
+          subscribedChannel = channel;
           await redisSubscriber.subscribe(channel, onRedisMessage);
+
+          // Guarda anti-corrida: caso a Cito tenha publicado um novo round durante o subscribe.
+          const postSubscribeState = await getLiveMatchState(canonicalMatchId);
+          if (
+            postSubscribeState !== null &&
+            (initialState === null || postSubscribeState.sequence > initialState.sequence) &&
+            !cleanedUp &&
+            socket.readyState === socket.OPEN
+          ) {
+            socket.send(
+              JSON.stringify({
+                type: 'match:state',
+                matchId: canonicalMatchId,
+                data: postSubscribeState,
+                timestamp: Date.now(),
+              }),
+            );
+          }
         }
       } catch (err) {
-        app.log.error({ err, matchId }, '[ws] Falha ao inicializar estado/PubSub da partida');
+        app.log.error(
+          { err, rawMatchId, matchId: canonicalMatchId },
+          '[ws] Falha ao inicializar estado/PubSub da partida',
+        );
         if (socket.readyState === socket.OPEN) {
           socket.send(
             JSON.stringify({

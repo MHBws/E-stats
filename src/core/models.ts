@@ -183,6 +183,18 @@ export interface CS2TeamEconomy {
   buyType: CS2BuyType | null;
 }
 
+/** Estatísticas individuais em tempo real de um jogador no mapa atual. */
+export interface CS2PlayerLiveStats {
+  playerId: string;
+  nickname: string;
+  kills: number;
+  deaths: number;
+  assists: number;
+  /** Dinheiro atual do jogador no round (Bank em $). */
+  money: number;
+  alive: boolean;
+}
+
 /** Placar e contexto de um time no mapa atual. */
 export interface CS2TeamLiveState {
   teamId: UUID;
@@ -195,6 +207,8 @@ export interface CS2TeamLiveState {
   mapsWon: number;
   playersAlive: number;
   economy: CS2TeamEconomy;
+  /** [UPDATE]: Jogadores do time com K/D/A, Bank e status vivo/eliminado vindos da Cito. */
+  players?: CS2PlayerLiveStats[];
 }
 
 /** Status da bomba no round atual. */
