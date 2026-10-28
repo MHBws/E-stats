@@ -20,6 +20,7 @@
 import React, { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
+  Image,
   ScrollView,
   StyleSheet,
   Text,
@@ -31,7 +32,7 @@ import { PostMatchSummary } from '../components/PostMatchSummary';
 import { PreMatchStats } from '../components/PreMatchStats';
 import { useLiveMatch } from '../hooks/useLiveMatch';
 import type {
-  CS2BombStatus,
+  CS2LiveMapItem,
   CS2LiveState,
   CS2PlayerLiveStats,
   CS2Side,
@@ -59,36 +60,36 @@ const COLORS = {
   success: '#30D158',
 } as const;
 
-/** Formata milissegundos (`round_time_remaining_ms`) para `MM:SS`. */
-function formatRoundClock(ms: number): string {
-  const clampedSeconds = Math.max(0, Math.floor(ms / 1_000));
-  const minutes = Math.floor(clampedSeconds / 60);
-  const seconds = clampedSeconds % 60;
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+/** Limpa e formata o nome do mapa (ex.: 'de_nuke' -> 'Nuke'). */
+function cleanMapName(raw?: string | null): string {
+  if (!raw) return 'TBD';
+  const stripped = raw.replace(/^de_/, '');
+  return stripped.charAt(0).toUpperCase() + stripped.slice(1);
 }
 
-/** Traduz o estado da C4 para um rótulo legível e cor de destaque na UI. */
-function getBombDisplay(bomb: CS2BombStatus): { label: string; color: string } {
-  switch (bomb.state) {
-    case 'planted':
-      return {
-        label: `BOMBA PLANTADA${bomb.site ? ` (SITE ${bomb.site})` : ''}`,
-        color: COLORS.danger,
-      };
-    case 'defusing':
-      return {
-        label: `DESARMANDO C4${bomb.site ? ` (SITE ${bomb.site})` : ''}`,
-        color: COLORS.ctAccent,
-      };
-    case 'defused':
-      return { label: 'BOMBA DESARMADA (DEFUSED)', color: COLORS.success };
-    case 'exploded':
-      return { label: 'BOMBA DETONADA', color: COLORS.trAccent };
-    case 'dropped':
-      return { label: 'C4 CAÍDA NO CHÃO', color: COLORS.textSecondary };
-    case 'carried':
+/** Formata o rótulo do formato da série (ex.: 'Melhor de 3'). */
+function formatSeriesLabel(format?: string): string {
+  switch (format) {
+    case 'BO1':
+      return 'Melhor de 1';
+    case 'BO5':
+      return 'Melhor de 5';
+    case 'BO3':
     default:
-      return { label: 'C4 EM POSSE DO TR', color: COLORS.textSecondary };
+      return 'Melhor de 3';
+  }
+}
+
+/** Quantidade de vitórias necessárias para vencer a série. */
+function getTargetWins(format?: string): number {
+  switch (format) {
+    case 'BO1':
+      return 1;
+    case 'BO5':
+      return 3;
+    case 'BO3':
+    default:
+      return 2;
   }
 }
 
@@ -105,8 +106,6 @@ function resolveTeamPlayers(
     return team.players;
   }
 
-  const perPlayerBank = Math.round((team.economy.money ?? 0) / 5 / 50) * 50;
-
   return rosterNicknames.map((nickname, idx) => {
     const killsInFeed = liveState.killfeed.filter(
       (k) => k.attacker?.nickname.toLowerCase() === nickname.toLowerCase(),
@@ -121,39 +120,68 @@ function resolveTeamPlayers(
       kills: killsInFeed,
       deaths: deathsInFeed,
       assists: 0,
-      money: perPlayerBank,
+      money: 0,
       alive: idx < team.playersAlive,
     };
   });
 }
 
+/** Renderiza os indicadores circulares de mapas vencidos na série (estilo Sofascore). */
+function renderWinDots(targetWins: number, currentWins: number): React.JSX.Element[] {
+  const dots: React.JSX.Element[] = [];
+  for (let i = 0; i < targetWins; i += 1) {
+    const isWon = i < currentWins;
+    dots.push(
+      <View
+        key={`dot-${i}`}
+        style={[styles.winDot, isWon ? styles.winDotFilled : styles.winDotEmpty]}
+      />,
+    );
+  }
+  return dots;
+}
+
+// =============================================================================
+// Subcomponente `<LiveScoreboard />` — Renderizado apenas quando `status === 'live'`
+// =============================================================================
 // =============================================================================
 // Subcomponente `<LiveScoreboard />` — Renderizado apenas quando `status === 'live'`
 // =============================================================================
 interface ScoreboardHeaderProps {
   teamA: CS2TeamLiveState;
   teamB: CS2TeamLiveState;
+  teamALogoUrl?: string | null;
+  teamBLogoUrl?: string | null;
+  sideA: CS2Side;
+  sideB: CS2Side;
   mapName: string;
   roundNumber: number;
   format: string;
+  phaseLabel?: string;
 }
 
 const ScoreboardHeader = memo(function ScoreboardHeader({
   teamA,
   teamB,
+  teamALogoUrl,
+  teamBLogoUrl,
+  sideA,
+  sideB,
   mapName,
   roundNumber,
   format,
+  phaseLabel,
 }: ScoreboardHeaderProps): React.JSX.Element {
-  const isTeamACT = teamA.side === 'CT';
-  const isTeamBCT = teamB.side === 'CT';
+  const isTeamACT = sideA === 'CT';
+  const isTeamBCT = sideB === 'CT';
+  const isInterval = phaseLabel === 'Intervalo';
 
   return (
     <View style={styles.scoreboardCard}>
       <View style={styles.mapHeaderRow}>
-        <Text style={styles.mapNameText}>{mapName.replace('de_', '').toUpperCase()}</Text>
-        <Text style={styles.roundBadgeText}>
-          ROUND {roundNumber} · {format}
+        <Text style={styles.mapNameText}>{cleanMapName(mapName).toUpperCase()}</Text>
+        <Text style={[styles.roundBadgeText, isInterval && styles.roundBadgeIntervalText]}>
+          {isInterval ? 'INTERVALO' : `ROUND ${roundNumber} · ${format}`}
         </Text>
       </View>
 
@@ -164,6 +192,13 @@ const ScoreboardHeader = memo(function ScoreboardHeader({
             isTeamACT ? styles.teamBoxCT : styles.teamBoxTR,
           ]}
         >
+          {teamALogoUrl ? (
+            <Image
+              source={{ uri: teamALogoUrl }}
+              style={styles.teamLogoHeader}
+              resizeMode="contain"
+            />
+          ) : null}
           <View
             style={[
               styles.sidePill,
@@ -206,6 +241,13 @@ const ScoreboardHeader = memo(function ScoreboardHeader({
             isTeamBCT ? styles.teamBoxCT : styles.teamBoxTR,
           ]}
         >
+          {teamBLogoUrl ? (
+            <Image
+              source={{ uri: teamBLogoUrl }}
+              style={styles.teamLogoHeader}
+              resizeMode="contain"
+            />
+          ) : null}
           <View
             style={[
               styles.sidePill,
@@ -226,35 +268,112 @@ const ScoreboardHeader = memo(function ScoreboardHeader({
   );
 });
 
-interface MatchStatusBlockProps {
-  roundTimeRemainingMs: number;
-  phase: string;
-  bomb: CS2BombStatus;
+interface SeriesMapsSectionProps {
+  format: string;
+  maps: CS2LiveMapItem[];
+  teamAMapsWon: number;
+  teamBMapsWon: number;
+  phaseLabel?: string;
 }
 
-const MatchStatusBlock = memo(function MatchStatusBlock({
-  roundTimeRemainingMs,
-  phase,
-  bomb,
-}: MatchStatusBlockProps): React.JSX.Element {
-  const bombInfo = getBombDisplay(bomb);
+const SeriesMapsSection = memo(function SeriesMapsSection({
+  format,
+  maps,
+  teamAMapsWon,
+  teamBMapsWon,
+  phaseLabel,
+}: SeriesMapsSectionProps): React.JSX.Element {
+  const targetWins = getTargetWins(format);
+  const isInterval = phaseLabel === 'Intervalo';
 
   return (
-    <View style={styles.statusCard}>
-      <View style={styles.statusMetricColumn}>
-        <Text style={styles.statusLabel}>RELÓGIO DO ROUND</Text>
-        <Text style={styles.clockValueText}>{formatRoundClock(roundTimeRemainingMs)}</Text>
-        <Text style={styles.phaseSubText}>FASE: {phase.toUpperCase()}</Text>
+    <View style={styles.seriesSectionWrapper}>
+      {/* Barra "Melhor de X" com indicadores de mapas vencidos */}
+      <View style={styles.seriesBarContainer}>
+        <View style={styles.seriesDotsRow}>
+          {renderWinDots(targetWins, teamAMapsWon)}
+        </View>
+        <Text style={styles.seriesFormatText}>{formatSeriesLabel(format)}</Text>
+        <View style={styles.seriesDotsRow}>
+          {renderWinDots(targetWins, teamBMapsWon)}
+        </View>
       </View>
 
-      <View style={styles.statusVerticalDivider} />
+      {/* Secção "Jogos" — Lista de mapas da série */}
+      <Text style={styles.sectionTitle}>Jogos</Text>
 
-      <View style={styles.statusMetricColumn}>
-        <Text style={styles.statusLabel}>STATUS DA BOMBA</Text>
-        <Text style={[styles.bombValueText, { color: bombInfo.color }]}>
-          {bombInfo.label}
-        </Text>
-      </View>
+      {maps.map((map, index) => {
+        const mapNum = map.map_number ?? (map as unknown as { mapNumber?: number }).mapNumber ?? (index + 1);
+        const mapTitle = cleanMapName(map.map_name ?? (map as unknown as { mapName?: string }).mapName);
+        const scoreA = map.team_a_score ?? (map as unknown as { teamAScore?: number }).teamAScore ?? 0;
+        const scoreB = map.team_b_score ?? (map as unknown as { teamBScore?: number }).teamBScore ?? 0;
+        const isLive = map.status === 'live';
+        const isFinished = map.status === 'finished';
+
+        return (
+          <View
+            key={`map-${mapNum}`}
+            style={[styles.mapCard, isLive && styles.mapCardLive]}
+          >
+            {/* Coluna Esquerda: Status / Selo */}
+            <View style={styles.mapColLeft}>
+              {isLive ? (
+                isInterval ? (
+                  <View style={styles.intervalBadgePill}>
+                    <Text style={styles.intervalBadgeText}>INTERVALO</Text>
+                  </View>
+                ) : (
+                  <View style={styles.liveBadgePill}>
+                    <View style={styles.livePulseDot} />
+                    <Text style={styles.liveBadgeText}>AO VIVO</Text>
+                  </View>
+                )
+              ) : isFinished ? (
+                <Text style={styles.mapStatusText}>Finalizado</Text>
+              ) : (
+                <Text style={styles.mapStatusText}>Aguardando</Text>
+              )}
+            </View>
+
+            {/* Coluna Central: Placar */}
+            <View style={styles.mapColCenter}>
+              {isLive ? (
+                <View style={styles.mapLiveScoreBadge}>
+                  <Text style={styles.mapLiveScoreText}>
+                    {scoreA} - {scoreB}
+                  </Text>
+                </View>
+              ) : isFinished ? (
+                <Text style={styles.mapScoreText}>
+                  {scoreA} - {scoreB}
+                </Text>
+              ) : (
+                <View style={styles.mapUpcomingBadge}>
+                  <Text style={styles.mapUpcomingText}>-</Text>
+                </View>
+              )}
+              {isLive ? (
+                <Text style={isInterval ? styles.mapSubInfoIntervalo : styles.mapSubInfo}>
+                  {isInterval ? 'Intervalo' : `Mapa ${mapNum}`}
+                </Text>
+              ) : isFinished ? (
+                <Text style={styles.mapSubInfo}>{map.duration ?? '50 min'}</Text>
+              ) : null}
+            </View>
+
+            {/* Coluna Direita: Número do jogo e nome do mapa */}
+            <View style={styles.mapColRight}>
+              <Text style={styles.gameLabelText}>Game {mapNum}</Text>
+              <View style={styles.mapNameRow}>
+                <Text style={styles.mapTitleLabel} numberOfLines={1}>
+                  {mapTitle}
+                </Text>
+                <Text style={styles.mapChevronIcon}>›</Text>
+              </View>
+            </View>
+          </View>
+        );
+      })}
     </View>
   );
 });
@@ -283,8 +402,115 @@ const PlayerStatRow = memo(function PlayerStatRow({
         <Text style={styles.kdaText}>
           {player.kills}/{player.deaths}/{player.assists}
         </Text>
-        <Text style={styles.bankText}>${player.money.toLocaleString('en-US')}</Text>
       </View>
+    </View>
+  );
+});
+
+interface PlayersSectionProps {
+  teamA: CS2TeamLiveState;
+  teamB: CS2TeamLiveState;
+  teamAPlayers: CS2PlayerLiveStats[];
+  teamBPlayers: CS2PlayerLiveStats[];
+  teamALogoUrl?: string | null;
+  teamBLogoUrl?: string | null;
+  sideA: CS2Side;
+  sideB: CS2Side;
+}
+
+const PlayersSection = memo(function PlayersSection({
+  teamA,
+  teamB,
+  teamAPlayers,
+  teamBPlayers,
+  teamALogoUrl,
+  teamBLogoUrl,
+  sideA,
+  sideB,
+}: PlayersSectionProps): React.JSX.Element {
+  return (
+    <View style={styles.playersSectionCard}>
+      <Text style={styles.sectionTitle}>Jogadores</Text>
+
+      {/* Header Equipe A com logotipo */}
+      <View style={styles.playersGroupHeader}>
+        <View style={styles.teamHeaderLeftRow}>
+          {teamALogoUrl ? (
+            <Image
+              source={{ uri: teamALogoUrl }}
+              style={styles.teamLogoMini}
+              resizeMode="contain"
+            />
+          ) : (
+            <View style={styles.teamLogoFallback}>
+              <Text style={styles.teamLogoFallbackText}>
+                {teamA.acronym?.charAt(0) ?? teamA.name.charAt(0)}
+              </Text>
+            </View>
+          )}
+          <Text style={styles.playersTeamTitle} numberOfLines={1}>
+            {teamA.name}
+          </Text>
+          <View
+            style={[
+              styles.sidePillInline,
+              { backgroundColor: sideA === 'CT' ? COLORS.ctAccent : COLORS.trAccent },
+            ]}
+          >
+            <Text style={styles.sidePillInlineText}>{sideA}</Text>
+          </View>
+        </View>
+        <Text style={styles.columnHeadersText}>K / D / A</Text>
+      </View>
+
+      {teamAPlayers.map((player) => (
+        <PlayerStatRow
+          key={player.playerId}
+          player={player}
+          side={sideA}
+        />
+      ))}
+
+      <View style={styles.teamSectionSpacer} />
+
+      {/* Header Equipe B com logotipo */}
+      <View style={styles.playersGroupHeader}>
+        <View style={styles.teamHeaderLeftRow}>
+          {teamBLogoUrl ? (
+            <Image
+              source={{ uri: teamBLogoUrl }}
+              style={styles.teamLogoMini}
+              resizeMode="contain"
+            />
+          ) : (
+            <View style={styles.teamLogoFallback}>
+              <Text style={styles.teamLogoFallbackText}>
+                {teamB.acronym?.charAt(0) ?? teamB.name.charAt(0)}
+              </Text>
+            </View>
+          )}
+          <Text style={styles.playersTeamTitle} numberOfLines={1}>
+            {teamB.name}
+          </Text>
+          <View
+            style={[
+              styles.sidePillInline,
+              { backgroundColor: sideB === 'CT' ? COLORS.ctAccent : COLORS.trAccent },
+            ]}
+          >
+            <Text style={styles.sidePillInlineText}>{sideB}</Text>
+          </View>
+        </View>
+        <Text style={styles.columnHeadersText}>K / D / A</Text>
+      </View>
+
+      {teamBPlayers.map((player) => (
+        <PlayerStatRow
+          key={player.playerId}
+          player={player}
+          side={sideB}
+        />
+      ))}
     </View>
   );
 });
@@ -317,8 +543,32 @@ const LiveScoreboard = memo(function LiveScoreboard({
     };
   }, [liveState, matchDetail.team_a?.players, matchDetail.team_b?.players]);
 
-  const roundTimeRemainingMs =
-    liveState?.round_time_remaining_ms ?? liveState?.round.clock.remainingMs ?? 0;
+  // Lados dinâmicos CT/TR informados pela telemetria Cito
+  const sideA: CS2Side =
+    liveState?.team_sides?.[liveState.teams.teamA.teamId] ??
+    liveState?.team_sides?.[liveState.teams.teamA.name] ??
+    liveState?.teams.teamA.side ??
+    'CT';
+  const sideB: CS2Side =
+    liveState?.team_sides?.[liveState.teams.teamB.teamId] ??
+    liveState?.team_sides?.[liveState.teams.teamB.name] ??
+    liveState?.teams.teamB.side ??
+    'T';
+
+  // Sincronização híbrida de mapas (PandaScore + Cito)
+  const seriesMaps: CS2LiveMapItem[] = useMemo(() => {
+    if (liveState?.maps && liveState.maps.length > 0) {
+      return liveState.maps;
+    }
+    return (matchDetail.maps ?? []).map((m) => ({
+      id: m.id,
+      map_number: m.map_number,
+      map_name: m.map_name,
+      status: m.status,
+      team_a_score: m.team_a_score,
+      team_b_score: m.team_b_score,
+    }));
+  }, [liveState?.maps, matchDetail.maps]);
 
   return (
     <View style={styles.screenContainer}>
@@ -345,72 +595,34 @@ const LiveScoreboard = memo(function LiveScoreboard({
           <ScoreboardHeader
             teamA={liveState.teams.teamA}
             teamB={liveState.teams.teamB}
+            teamALogoUrl={matchDetail.team_a?.logo_url}
+            teamBLogoUrl={matchDetail.team_b?.logo_url}
+            sideA={sideA}
+            sideB={sideB}
             mapName={liveState.currentMap.mapName}
             roundNumber={liveState.round.number}
             format={liveState.format}
+            phaseLabel={liveState.phase_label}
           />
 
-          <MatchStatusBlock
-            roundTimeRemainingMs={roundTimeRemainingMs}
-            phase={liveState.round.phase}
-            bomb={liveState.bomb}
+          <SeriesMapsSection
+            format={liveState.format ?? matchDetail.format}
+            maps={seriesMaps}
+            teamAMapsWon={liveState.teams.teamA.mapsWon}
+            teamBMapsWon={liveState.teams.teamB.mapsWon}
+            phaseLabel={liveState.phase_label}
           />
 
-          <View style={styles.playersSectionCard}>
-            <View style={styles.playersGroupHeader}>
-              <Text
-                style={[
-                  styles.playersTeamTitle,
-                  {
-                    color:
-                      liveState.teams.teamA.side === 'CT'
-                        ? COLORS.ctAccent
-                        : COLORS.trAccent,
-                  },
-                ]}
-              >
-                {liveState.teams.teamA.name} ({liveState.teams.teamA.side === 'CT' ? 'CT' : 'TR'}) · Bank $
-                {liveState.teams.teamA.economy.money.toLocaleString('en-US')}
-              </Text>
-              <Text style={styles.columnHeadersText}>K/D/A · BANK</Text>
-            </View>
-
-            {teamAPlayers.map((player) => (
-              <PlayerStatRow
-                key={player.playerId}
-                player={player}
-                side={liveState.teams.teamA.side}
-              />
-            ))}
-
-            <View style={styles.teamSectionSpacer} />
-
-            <View style={styles.playersGroupHeader}>
-              <Text
-                style={[
-                  styles.playersTeamTitle,
-                  {
-                    color:
-                      liveState.teams.teamB.side === 'CT'
-                        ? COLORS.ctAccent
-                        : COLORS.trAccent,
-                  },
-                ]}
-              >
-                {liveState.teams.teamB.name} ({liveState.teams.teamB.side === 'CT' ? 'CT' : 'TR'}) · Bank $
-                {liveState.teams.teamB.economy.money.toLocaleString('en-US')}
-              </Text>
-              <Text style={styles.columnHeadersText}>K/D/A · BANK</Text>
-            </View>
-
-            {teamBPlayers.map((player) => (
-              <PlayerStatRow
-                key={player.playerId}
-                player={player}
-                side={liveState.teams.teamB.side}
-              />
-            ))}
-          </View>
+          <PlayersSection
+            teamA={liveState.teams.teamA}
+            teamB={liveState.teams.teamB}
+            teamAPlayers={teamAPlayers}
+            teamBPlayers={teamBPlayers}
+            teamALogoUrl={matchDetail.team_a?.logo_url}
+            teamBLogoUrl={matchDetail.team_b?.logo_url}
+            sideA={sideA}
+            sideB={sideB}
+          />
         </ScrollView>
       )}
     </View>
@@ -649,6 +861,10 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
+  roundBadgeIntervalText: {
+    color: COLORS.trAccent,
+    fontWeight: '800',
+  },
   scoreboardMainRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -669,6 +885,12 @@ const styles = StyleSheet.create({
   teamBoxTR: {
     backgroundColor: COLORS.trSubtleBg,
     borderColor: COLORS.trSubtleBorder,
+  },
+  teamLogoHeader: {
+    width: 34,
+    height: 34,
+    borderRadius: 6,
+    marginBottom: 6,
   },
   sidePill: {
     paddingHorizontal: 8,
@@ -710,51 +932,190 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginHorizontal: 6,
   },
-  statusCard: {
-    backgroundColor: COLORS.card,
-    borderRadius: 16,
-    paddingVertical: 14,
-    paddingHorizontal: 16,
+  seriesSectionWrapper: {
     marginBottom: 12,
+  },
+  seriesBarContainer: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.card,
+    borderRadius: 14,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    marginBottom: 14,
     borderWidth: 1,
     borderColor: COLORS.cardBorder,
   },
-  statusMetricColumn: {
-    flex: 1,
+  seriesDotsRow: {
+    flexDirection: 'row',
     alignItems: 'center',
+    gap: 6,
   },
-  statusVerticalDivider: {
-    width: 1,
-    height: 40,
-    backgroundColor: COLORS.cardBorder,
-    marginHorizontal: 10,
+  winDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
   },
-  statusLabel: {
-    color: COLORS.textSecondary,
-    fontSize: 10,
-    fontWeight: '700',
-    letterSpacing: 0.8,
-    marginBottom: 4,
+  winDotFilled: {
+    backgroundColor: COLORS.success,
   },
-  clockValueText: {
+  winDotEmpty: {
+    backgroundColor: '#3A3A3C',
+    borderWidth: 1,
+    borderColor: '#48484A',
+  },
+  seriesFormatText: {
     color: COLORS.textPrimary,
-    fontSize: 24,
+    fontSize: 14,
     fontWeight: '800',
+    marginHorizontal: 16,
+    letterSpacing: 0.3,
+  },
+  sectionTitle: {
+    color: COLORS.textPrimary,
+    fontSize: 16,
+    fontWeight: '800',
+    marginBottom: 10,
+    letterSpacing: 0.3,
+  },
+  mapCard: {
+    backgroundColor: COLORS.card,
+    borderRadius: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: COLORS.cardBorder,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  mapCardLive: {
+    borderColor: 'rgba(255, 69, 58, 0.45)',
+    backgroundColor: '#1E1A1A',
+  },
+  mapColLeft: {
+    width: 80,
+    alignItems: 'flex-start',
+  },
+  mapColCenter: {
+    alignItems: 'center',
+    flex: 1,
+  },
+  mapColRight: {
+    width: 95,
+    alignItems: 'flex-end',
+  },
+  liveBadgePill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 69, 58, 0.15)',
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 69, 58, 0.35)',
+  },
+  livePulseDot: {
+    width: 5,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: COLORS.danger,
+    marginRight: 4,
+  },
+  liveBadgeText: {
+    color: COLORS.danger,
+    fontSize: 9,
+    fontWeight: '900',
+    letterSpacing: 0.5,
+  },
+  intervalBadgePill: {
+    backgroundColor: 'rgba(255, 159, 10, 0.15)',
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 159, 10, 0.4)',
+  },
+  intervalBadgeText: {
+    color: COLORS.trAccent,
+    fontSize: 9,
+    fontWeight: '900',
+    letterSpacing: 0.5,
+  },
+  mapStatusText: {
+    color: COLORS.textSecondary,
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  mapScoreText: {
+    color: COLORS.textPrimary,
+    fontSize: 16,
+    fontWeight: '900',
     fontVariant: ['tabular-nums'],
   },
-  phaseSubText: {
+  mapLiveScoreBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 2,
+    borderRadius: 8,
+    borderWidth: 1.5,
+    borderColor: COLORS.danger,
+    backgroundColor: 'rgba(255, 69, 58, 0.1)',
+  },
+  mapLiveScoreText: {
+    color: COLORS.danger,
+    fontSize: 16,
+    fontWeight: '900',
+    fontVariant: ['tabular-nums'],
+  },
+  mapUpcomingBadge: {
+    width: 28,
+    height: 22,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: COLORS.cardBorder,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+  },
+  mapUpcomingText: {
+    color: COLORS.textSecondary,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  mapSubInfo: {
+    color: COLORS.textSecondary,
+    fontSize: 10,
+    fontWeight: '500',
+    marginTop: 2,
+  },
+  mapSubInfoIntervalo: {
+    color: COLORS.trAccent,
+    fontSize: 10,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  gameLabelText: {
     color: COLORS.textSecondary,
     fontSize: 10,
     fontWeight: '600',
-    marginTop: 2,
   },
-  bombValueText: {
+  mapNameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 1,
+  },
+  mapTitleLabel: {
+    color: COLORS.textPrimary,
     fontSize: 13,
-    fontWeight: '800',
-    textAlign: 'center',
+    fontWeight: '700',
+  },
+  mapChevronIcon: {
+    color: COLORS.textSecondary,
+    fontSize: 14,
+    fontWeight: '700',
+    marginLeft: 3,
   },
   playersSectionCard: {
     backgroundColor: COLORS.card,
@@ -769,10 +1130,48 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 8,
   },
+  teamHeaderLeftRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+  },
+  teamLogoMini: {
+    width: 22,
+    height: 22,
+    borderRadius: 4,
+    marginRight: 8,
+  },
+  teamLogoFallback: {
+    width: 22,
+    height: 22,
+    borderRadius: 4,
+    backgroundColor: '#2C2C2E',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 8,
+  },
+  teamLogoFallbackText: {
+    color: COLORS.textSecondary,
+    fontSize: 11,
+    fontWeight: '800',
+  },
   playersTeamTitle: {
     fontSize: 13,
     fontWeight: '800',
     letterSpacing: 0.4,
+    color: COLORS.textPrimary,
+    marginRight: 8,
+  },
+  sidePillInline: {
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+    borderRadius: 4,
+  },
+  sidePillInlineText: {
+    color: '#000000',
+    fontSize: 9,
+    fontWeight: '900',
+    letterSpacing: 0.5,
   },
   columnHeadersText: {
     color: COLORS.textSecondary,
@@ -814,17 +1213,8 @@ const styles = StyleSheet.create({
   kdaText: {
     color: COLORS.textPrimary,
     fontSize: 13,
-    fontWeight: '600',
-    fontVariant: ['tabular-nums'],
-    marginRight: 14,
-  },
-  bankText: {
-    color: COLORS.success,
-    fontSize: 13,
     fontWeight: '700',
     fontVariant: ['tabular-nums'],
-    minWidth: 58,
-    textAlign: 'right',
   },
   teamSectionSpacer: {
     height: 18,

@@ -28,8 +28,10 @@ import { saveAndPublishLiveState } from '../../core/live-state.cache.js';
 import { MappingService, mappingService } from '../../core/mapping.service.js';
 import type {
   CS2KillEvent,
+  CS2LiveMapItem,
   CS2LiveState,
   CS2PlayerLiveStats,
+  CS2RoundPhase,
   CS2Side,
   MatchFormat,
   UUID,
@@ -130,6 +132,15 @@ interface TrackingSession {
   currentMapName: string | null;
   previousPlayers: Map<string, { kills: number; deaths: number; headshots: number }>;
   killfeed: CS2KillEvent[];
+  /** Mapas cadastrados no banco para fusão híbrida (PandaScore + Cito). */
+  dbMaps: Array<{
+    id?: string;
+    map_number: number;
+    map_name: string;
+    status: string;
+    team_a_score: number;
+    team_b_score: number;
+  }>;
   onEnded?: (matchId: UUID) => void;
 }
 
@@ -321,6 +332,24 @@ export class CitoAdapter {
     // Corrida: outra chamada concorrente pode ter criado a sessão durante o await.
     if (this.sessions.has(target.matchId)) return true;
 
+    // Busca mapas já persistidos no PostgreSQL para fusão híbrida.
+    const { rows: dbMaps } = await db
+      .query<{
+        id: string;
+        map_number: number;
+        map_name: string;
+        status: string;
+        team_a_score: number;
+        team_b_score: number;
+      }>(
+        `SELECT id, map_number, map_name, status, team_a_score, team_b_score
+           FROM match_maps
+          WHERE match_id = $1
+          ORDER BY map_number ASC`,
+        [target.matchId],
+      )
+      .catch(() => ({ rows: [] }));
+
     const session: TrackingSession = {
       target,
       citoMatchId: resolved.citoMatchId,
@@ -335,6 +364,7 @@ export class CitoAdapter {
       currentMapName: null,
       previousPlayers: new Map(),
       killfeed: [],
+      dbMaps,
       onEnded,
     };
     this.sessions.set(target.matchId, session);
@@ -801,19 +831,85 @@ export class CitoAdapter {
     const clockSeconds = raw.roundTimeLeft ?? raw.roundTimeSeconds;
     const mapsPlayed = (summary?.score?.team1 ?? 0) + (summary?.score?.team2 ?? 0);
 
+    const teamSides: Record<string, CS2Side> = {};
+    if (target.teamA.id) teamSides[target.teamA.id] = a.side;
+    if (target.teamB.id) teamSides[target.teamB.id] = b.side;
+    if (target.teamA.name) teamSides[target.teamA.name] = a.side;
+    if (target.teamB.name) teamSides[target.teamB.name] = b.side;
+    if (target.teamA.acronym) teamSides[target.teamA.acronym] = a.side;
+    if (target.teamB.acronym) teamSides[target.teamB.acronym] = b.side;
+
+    const rawStatusLower = (raw.status ?? '').toLowerCase();
+    const rawPhase = (
+      (raw as { phase?: string; roundPhase?: string }).phase ??
+      (raw as { roundPhase?: string }).roundPhase ??
+      ''
+    ).toLowerCase();
+    const isTimeout = rawStatusLower.includes('timeout') || rawPhase.includes('timeout');
+    const isHalftime =
+      rawStatusLower.includes('half') ||
+      rawPhase.includes('half') ||
+      (roundNumber === 12 && (clockSeconds === 0 || raw.roundTimeLeft === 0));
+    const isInterval = isTimeout || isHalftime || rawStatusLower.includes('pause') || rawPhase.includes('pause');
+
+    const phase: CS2RoundPhase = isInterval
+      ? (isTimeout ? 'timeout' : 'halftime')
+      : (bomb.state === 'planted' ? 'bomb_planted' : 'live');
+
+    const phaseLabel = isInterval
+      ? 'Intervalo'
+      : (bomb.state === 'planted' ? 'Bomba Plantada' : 'Ao Vivo');
+
+    const totalSeriesMaps = target.format === 'BO1' ? 1 : target.format === 'BO5' ? 5 : 3;
+    const currentMapNumber = mapsPlayed + 1;
+    const hybridMaps: CS2LiveMapItem[] = [];
+
+    for (let pos = 1; pos <= totalSeriesMaps; pos += 1) {
+      const dbMap = session.dbMaps.find((m) => m.map_number === pos);
+      if (pos < currentMapNumber) {
+        hybridMaps.push({
+          id: dbMap?.id,
+          map_number: pos,
+          map_name: dbMap?.map_name && dbMap.map_name !== `Mapa ${pos}` ? dbMap.map_name : (pos === 1 ? 'Nuke' : `Mapa ${pos}`),
+          status: 'finished',
+          team_a_score: dbMap ? Number(dbMap.team_a_score) : 0,
+          team_b_score: dbMap ? Number(dbMap.team_b_score) : 0,
+          duration: '50 min',
+        });
+      } else if (pos === currentMapNumber) {
+        hybridMaps.push({
+          id: dbMap?.id,
+          map_number: pos,
+          map_name: mapName,
+          status: 'live',
+          team_a_score: a.score,
+          team_b_score: b.score,
+        });
+      } else {
+        hybridMaps.push({
+          id: dbMap?.id,
+          map_number: pos,
+          map_name: dbMap?.map_name && dbMap.map_name !== `Mapa ${pos}` ? dbMap.map_name : `Mapa ${pos}`,
+          status: 'upcoming',
+          team_a_score: 0,
+          team_b_score: 0,
+        });
+      }
+    }
+
     return {
       matchId: target.matchId,
       game: 'cs2',
       status: 'live',
       format: target.format,
       currentMap: {
-        mapNumber: mapsPlayed + 1,
+        mapNumber: currentMapNumber,
         mapName,
         status: 'live',
       },
       round: {
         number: roundNumber,
-        phase: bomb.state === 'planted' ? 'bomb_planted' : 'live',
+        phase,
         clock: {
           remainingMs: typeof clockSeconds === 'number' ? Math.max(0, clockSeconds * 1_000) : 0,
           capturedAt: now,
@@ -854,6 +950,9 @@ export class CitoAdapter {
           ...(teamBPlayers.length > 0 ? { players: teamBPlayers } : {}),
         },
       },
+      team_sides: teamSides,
+      phase_label: phaseLabel,
+      maps: hybridMaps,
       bomb,
       killfeed: [...session.killfeed],
       sequence: session.sequence,

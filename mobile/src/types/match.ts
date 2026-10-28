@@ -215,6 +215,7 @@ export type CS2RoundPhase =
   | 'round_over'
   | 'halftime'
   | 'timeout'
+  | 'interval'
   | 'map_over';
 
 export type CS2BuyType = 'pistol' | 'eco' | 'semi_eco' | 'force' | 'full';
@@ -292,6 +293,17 @@ export interface CS2KillEvent {
   noScope: boolean;
 }
 
+/** Item da lista de mapas da série retornado na telemetria ao vivo. */
+export interface CS2LiveMapItem {
+  id?: string;
+  map_number: number;
+  map_name: string;
+  status: MapStatus;
+  team_a_score: number;
+  team_b_score: number;
+  duration?: string;
+}
+
 /** Snapshot completo do placar ao vivo recebido pelo WebSocket. */
 export interface CS2LiveState {
   matchId: UUID;
@@ -315,6 +327,12 @@ export interface CS2LiveState {
     teamA: CS2TeamLiveState;
     teamB: CS2TeamLiveState;
   };
+  /** [UPDATE]: Mapeamento dinâmico de lados CT/TR por ID, nome e sigla do time. */
+  team_sides?: Record<string, CS2Side>;
+  /** [UPDATE]: Rótulo legível da fase do round ('Intervalo', 'Ao Vivo', 'Pausa Técnica', etc.). */
+  phase_label?: string;
+  /** [UPDATE]: Lista híbrida consolidada de mapas da série (PandaScore + Cito). */
+  maps?: CS2LiveMapItem[];
   bomb: CS2BombStatus;
   killfeed: CS2KillEvent[];
   sequence: number;
