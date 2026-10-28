@@ -8,7 +8,7 @@
     "  expo-status-bar -> controle da barra de status no tema escuro (OLED)."
   ],
   "name": "e-stats-mobile",
-  "version": "1.0.0-pre-alpha",
+  "version": "1.0.1-pre-alpha",
   "private": true,
   "main": "node_modules/expo/AppEntry.js",
   "scripts": {
