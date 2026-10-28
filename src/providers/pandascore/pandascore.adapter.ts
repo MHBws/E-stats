@@ -81,6 +81,100 @@ export interface PandaScoreRawMatch {
     team_id: number;
     score: number;
   }>;
+  streams_list?: Array<{
+    main?: boolean;
+    official?: boolean;
+    language?: string | null;
+    raw_url?: string | null;
+    embed_url?: string | null;
+  }>;
+}
+
+/** Canal de transmissão ao vivo extraído de `streams_list` da PandaScore. */
+export interface PreMatchStreamDto {
+  platform: 'twitch' | 'youtube' | 'kick' | 'other';
+  channel_name: string;
+  language: string;
+  flag_emoji: string;
+  url: string;
+  is_official: boolean;
+  is_main: boolean;
+}
+
+/** Um dos últimos 5 jogos finalizados de uma equipe (Form / Desempenho recente). */
+export interface PreMatchTeamFormEntryDto {
+  match_id: string;
+  date: string;
+  tournament_name: string;
+  opponent_name: string;
+  opponent_acronym: string | null;
+  team_score: number;
+  opponent_score: number;
+  /** Ex.: `"2-0"`, `"1-2"`, `"13-9"`. */
+  score_label: string;
+  outcome: 'W' | 'L' | 'D';
+}
+
+/** Partida histórica individual do confronto direto (H2H) entre as duas equipes. */
+export interface PreMatchH2HMatchDto {
+  id: string;
+  date: string;
+  tournament_name: string;
+  team_a_name: string;
+  team_a_acronym: string | null;
+  team_a_score: number;
+  team_b_name: string;
+  team_b_acronym: string | null;
+  team_b_score: number;
+  winner_side: 'team_a' | 'team_b' | 'draw';
+}
+
+/** Resumo e histórico de confrontos diretos (Head-to-Head). */
+export interface PreMatchH2HSummaryDto {
+  team_a_wins: number;
+  team_b_wins: number;
+  draws: number;
+  total_matches: number;
+  matches: PreMatchH2HMatchDto[];
+}
+
+/** Linha da tabela de classificação (`standings`) do torneio/grupo. */
+export interface PreMatchStandingRowDto {
+  rank: number;
+  team_name: string;
+  team_acronym: string | null;
+  team_logo_url: string | null;
+  wins: number;
+  losses: number;
+  points: number;
+  is_team_a: boolean;
+  is_team_b: boolean;
+}
+
+/** Payload enriquecido pré-jogo estilo Sofascore retornado em `GET /api/matches/:id`. */
+export interface PreMatchStatsDto {
+  h2h: PreMatchH2HSummaryDto;
+  recent_form: {
+    team_a: PreMatchTeamFormEntryDto[];
+    team_b: PreMatchTeamFormEntryDto[];
+  };
+  standings: PreMatchStandingRowDto[];
+  streams: PreMatchStreamDto[];
+}
+
+/** Linha bruta retornada por `GET /tournaments/{id}/standings` na PandaScore. */
+interface PandaScoreRawStandingRow {
+  rank?: number | null;
+  wins?: number | null;
+  losses?: number | null;
+  ties?: number | null;
+  total?: number | null;
+  team?: {
+    id: number;
+    name: string;
+    acronym: string | null;
+    image_url: string | null;
+  } | null;
 }
 
 /** Jogador do roster retornado por `GET /matches/{id}/opponents` na PandaScore. */
@@ -141,6 +235,11 @@ export class PandaScoreAdapter {
   private readonly opponentsCache = new Map<
     string,
     { fetchedAt: number; opponents: NonNullable<PandaScoreOpponentsResponse['opponents']> }
+  >();
+  /** Cache em memória (TTL 5 min) de `preMatchStats` por UUID interno da partida. */
+  private readonly preMatchStatsCache = new Map<
+    string,
+    { fetchedAt: number; data: PreMatchStatsDto }
   >();
   /**
    * [UPDATE]: UUIDs das partidas com status `running` (AO VIVO) no último
@@ -817,5 +916,553 @@ export class PandaScoreAdapter {
     const opponents = Array.isArray(body?.opponents) ? body.opponents : [];
     this.opponentsCache.set(externalMatchId, { fetchedAt: now, opponents });
     return opponents;
+  }
+
+  /**
+   * [UPDATE]: Busca em paralelo (`Promise.all`) os dados relacionais avançados
+   * de pré-jogo na API da PandaScore:
+   *   a) H2H (Head-to-Head): histórico de confrontos diretos e saldo de vitórias.
+   *   b) Form (Desempenho recente): últimos 5 jogos concluídos de cada equipe.
+   *   c) Standings (Classificações): tabela atual do torneio/grupo com W-L e Pontos.
+   *   d) Streams: canais de transmissão oficiais/comunitários com idioma e bandeira.
+   */
+  async fetchPreMatchStats(params: {
+    matchId: UUID;
+    tournamentId: UUID;
+    teamA: { id: UUID; name: string; acronym: string | null } | null;
+    teamB: { id: UUID; name: string; acronym: string | null } | null;
+  }): Promise<PreMatchStatsDto> {
+    const emptyResult: PreMatchStatsDto = {
+      h2h: {
+        team_a_wins: 0,
+        team_b_wins: 0,
+        draws: 0,
+        total_matches: 0,
+        matches: [],
+      },
+      recent_form: {
+        team_a: [],
+        team_b: [],
+      },
+      standings: [],
+      streams: [],
+    };
+
+    const cached = this.preMatchStatsCache.get(params.matchId);
+    const now = Date.now();
+    if (cached && now - cached.fetchedAt < 5 * 60 * 1_000) {
+      return cached.data;
+    }
+
+    try {
+      const token = this.assertValidApiKey();
+
+      // Resolve em uma única query os IDs externos da PandaScore para partida, torneio e equipes.
+      const entityIds: UUID[] = [params.matchId, params.tournamentId];
+      if (params.teamA?.id) entityIds.push(params.teamA.id);
+      if (params.teamB?.id) entityIds.push(params.teamB.id);
+
+      const { rows: mappingRows } = await db.query<{
+        entity_id: UUID;
+        entity_type: string;
+        external_id: string;
+      }>(
+        `SELECT entity_id, entity_type, external_id
+           FROM provider_mappings
+          WHERE provider = 'pandascore'
+            AND entity_id = ANY($1::uuid[])`,
+        [entityIds],
+      );
+
+      const extMatchId =
+        mappingRows.find((r) => r.entity_type === 'match' && r.entity_id === params.matchId)
+          ?.external_id ?? null;
+      let extTournamentId =
+        mappingRows.find(
+          (r) => r.entity_type === 'tournament' && r.entity_id === params.tournamentId,
+        )?.external_id ?? null;
+      let extTeamAId =
+        (params.teamA &&
+          mappingRows.find((r) => r.entity_type === 'team' && r.entity_id === params.teamA?.id)
+            ?.external_id) ??
+        null;
+      let extTeamBId =
+        (params.teamB &&
+          mappingRows.find((r) => r.entity_type === 'team' && r.entity_id === params.teamB?.id)
+            ?.external_id) ??
+        null;
+
+      // 1ª Rodada `Promise.all`: busca o objeto completo da partida (para `streams_list`
+      // e fallback de IDs) em paralelo com os dados já conhecidos.
+      const rawMatch = extMatchId
+        ? await this.safeGetJson<PandaScoreRawMatch>(
+            `${this.coreApiUrl}/matches/${encodeURIComponent(extMatchId)}`,
+            token,
+          )
+        : null;
+
+      if (!extTournamentId && rawMatch?.tournament_id) {
+        extTournamentId = String(rawMatch.tournament_id);
+      }
+      if (!extTeamAId && rawMatch?.opponents?.[0]?.opponent?.id) {
+        extTeamAId = String(rawMatch.opponents[0].opponent.id);
+      }
+      if (!extTeamBId && rawMatch?.opponents?.[1]?.opponent?.id) {
+        extTeamBId = String(rawMatch.opponents[1].opponent.id);
+      }
+
+      // 2ª Rodada `Promise.all`: dispara simultaneamente histórico da Equipe A (até 200 jogos
+      // para cobrir confrontos diretos H2H mais antigos), histórico da Equipe B (100 jogos),
+      // tabela de classificação do torneio e partidas do torneio.
+      const [pastTeamA, pastTeamAPage2, pastTeamB, rawStandings, tournamentMatches] =
+        await Promise.all([
+          extTeamAId
+            ? this.safeGetArray<PandaScoreRawMatch>(
+                `${this.baseUrl}/matches/past?filter[opponent_id]=${encodeURIComponent(extTeamAId)}&per_page=100&page=1`,
+                token,
+              )
+            : Promise.resolve([]),
+          extTeamAId && extTeamBId
+            ? this.safeGetArray<PandaScoreRawMatch>(
+                `${this.baseUrl}/matches/past?filter[opponent_id]=${encodeURIComponent(extTeamAId)}&per_page=100&page=2`,
+                token,
+              )
+            : Promise.resolve([]),
+          extTeamBId
+            ? this.safeGetArray<PandaScoreRawMatch>(
+                `${this.baseUrl}/matches/past?filter[opponent_id]=${encodeURIComponent(extTeamBId)}&per_page=100&page=1`,
+                token,
+              )
+            : Promise.resolve([]),
+          extTournamentId
+            ? this.safeGetArray<PandaScoreRawStandingRow>(
+                `${this.coreApiUrl}/tournaments/${encodeURIComponent(extTournamentId)}/standings`,
+                token,
+              )
+            : Promise.resolve([]),
+          extTournamentId
+            ? this.safeGetArray<PandaScoreRawMatch>(
+                `${this.coreApiUrl}/tournaments/${encodeURIComponent(extTournamentId)}/matches?per_page=100`,
+                token,
+              )
+            : Promise.resolve([]),
+        ]);
+
+      const numTeamA = extTeamAId ? Number.parseInt(extTeamAId, 10) : null;
+      const numTeamB = extTeamBId ? Number.parseInt(extTeamBId, 10) : null;
+
+      // (a) Desempenho Recente (Form): últimos 5 jogos finalizados de cada equipe.
+      const formTeamA =
+        numTeamA !== null ? this.buildRecentForm(pastTeamA, numTeamA).slice(0, 5) : [];
+      const formTeamB =
+        numTeamB !== null ? this.buildRecentForm(pastTeamB, numTeamB).slice(0, 5) : [];
+
+      // (b) H2H (Head-to-Head): confrontos diretos entre Equipe A e Equipe B.
+      const h2h =
+        numTeamA !== null && numTeamB !== null
+          ? this.buildHeadToHead(
+              [...pastTeamA, ...pastTeamAPage2, ...pastTeamB],
+              numTeamA,
+              numTeamB,
+              params.teamA?.name ?? 'Equipe A',
+              params.teamA?.acronym ?? null,
+              params.teamB?.name ?? 'Equipe B',
+              params.teamB?.acronym ?? null,
+            )
+          : emptyResult.h2h;
+
+      // (c) Classificações (Standings) do grupo/torneio.
+      const standings = this.buildStandings(
+        rawStandings,
+        tournamentMatches,
+        numTeamA,
+        numTeamB,
+        params.teamA?.name ?? null,
+        params.teamB?.name ?? null,
+      );
+
+      // (d) Streams (Transmissões oficiais/comunitárias com idioma e bandeira).
+      const streams = this.buildStreamsList(rawMatch?.streams_list ?? []);
+
+      const result: PreMatchStatsDto = {
+        h2h,
+        recent_form: {
+          team_a: formTeamA,
+          team_b: formTeamB,
+        },
+        standings,
+        streams,
+      };
+
+      this.preMatchStatsCache.set(params.matchId, { fetchedAt: now, data: result });
+      return result;
+    } catch (err) {
+      console.warn(
+        `[pandascore] Aviso ao enriquecer preMatchStats para ${params.matchId}:`,
+        err instanceof Error ? err.message : err,
+      );
+      return emptyResult;
+    }
+  }
+
+  /** GET resiliente que retorna `null` em vez de quebrar o `Promise.all` caso um sub-recurso falhe. */
+  private async safeGetJson<T>(url: string, token: string): Promise<T | null> {
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!response.ok) return null;
+      return (await response.json()) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  /** GET resiliente para endpoints de lista da PandaScore. */
+  private async safeGetArray<T>(url: string, token: string): Promise<T[]> {
+    const data = await this.safeGetJson<unknown>(url, token);
+    return Array.isArray(data) ? (data as T[]) : [];
+  }
+
+  /** Constrói a lista dos últimos jogos concluídos de uma equipe (`W` / `L` / `D` + placar). */
+  private buildRecentForm(
+    pastMatches: PandaScoreRawMatch[],
+    teamExternalId: number,
+  ): PreMatchTeamFormEntryDto[] {
+    const entries: PreMatchTeamFormEntryDto[] = [];
+
+    for (const m of pastMatches) {
+      if (m.status !== 'finished') continue;
+      const oppEntry = m.opponents?.find((o) => o.opponent?.id !== teamExternalId)?.opponent ?? null;
+      if (!oppEntry) continue;
+
+      const { scoreA: teamScore, scoreB: oppScore } = this.extractPairScores(
+        m,
+        teamExternalId,
+        oppEntry.id,
+      );
+
+      let outcome: 'W' | 'L' | 'D' = 'D';
+      if (m.winner_id === teamExternalId || teamScore > oppScore) {
+        outcome = 'W';
+      } else if (m.winner_id === oppEntry.id || oppScore > teamScore) {
+        outcome = 'L';
+      }
+
+      entries.push({
+        match_id: String(m.id),
+        date: m.begin_at ?? m.scheduled_at ?? new Date().toISOString(),
+        tournament_name: this.formatTournamentName(m),
+        opponent_name: oppEntry.name,
+        opponent_acronym: oppEntry.acronym ?? null,
+        team_score: teamScore,
+        opponent_score: oppScore,
+        score_label: `${teamScore}-${oppScore}`,
+        outcome,
+      });
+
+      if (entries.length >= 5) break;
+    }
+
+    return entries;
+  }
+
+  /** Filtra e consolida todos os confrontos diretos (H2H) entre `teamA` e `teamB`. */
+  private buildHeadToHead(
+    candidateMatches: PandaScoreRawMatch[],
+    teamAExternalId: number,
+    teamBExternalId: number,
+    teamANameFallback: string,
+    teamAAcronymFallback: string | null,
+    teamBNameFallback: string,
+    teamBAcronymFallback: string | null,
+  ): PreMatchH2HSummaryDto {
+    const uniqueH2H = new Map<number, PandaScoreRawMatch>();
+
+    for (const m of candidateMatches) {
+      if (m.status !== 'finished') continue;
+      const ids = (m.opponents ?? []).map((o) => o.opponent?.id);
+      if (ids.includes(teamAExternalId) && ids.includes(teamBExternalId)) {
+        uniqueH2H.set(m.id, m);
+      }
+    }
+
+    const sorted = Array.from(uniqueH2H.values()).sort((x, y) => {
+      const tx = Date.parse(x.begin_at ?? x.scheduled_at ?? '') || 0;
+      const ty = Date.parse(y.begin_at ?? y.scheduled_at ?? '') || 0;
+      return ty - tx;
+    });
+
+    let teamAWins = 0;
+    let teamBWins = 0;
+    let draws = 0;
+    const matches: PreMatchH2HMatchDto[] = [];
+
+    for (const m of sorted) {
+      const oppA = m.opponents?.find((o) => o.opponent.id === teamAExternalId)?.opponent;
+      const oppB = m.opponents?.find((o) => o.opponent.id === teamBExternalId)?.opponent;
+      const { scoreA, scoreB } = this.extractPairScores(m, teamAExternalId, teamBExternalId);
+
+      let winnerSide: 'team_a' | 'team_b' | 'draw' = 'draw';
+      if (m.winner_id === teamAExternalId || scoreA > scoreB) {
+        winnerSide = 'team_a';
+        teamAWins += 1;
+      } else if (m.winner_id === teamBExternalId || scoreB > scoreA) {
+        winnerSide = 'team_b';
+        teamBWins += 1;
+      } else {
+        draws += 1;
+      }
+
+      matches.push({
+        id: String(m.id),
+        date: m.begin_at ?? m.scheduled_at ?? new Date().toISOString(),
+        tournament_name: this.formatTournamentName(m),
+        team_a_name: oppA?.name ?? teamANameFallback,
+        team_a_acronym: oppA?.acronym ?? teamAAcronymFallback,
+        team_a_score: scoreA,
+        team_b_name: oppB?.name ?? teamBNameFallback,
+        team_b_acronym: oppB?.acronym ?? teamBAcronymFallback,
+        team_b_score: scoreB,
+        winner_side: winnerSide,
+      });
+    }
+
+    return {
+      team_a_wins: teamAWins,
+      team_b_wins: teamBWins,
+      draws,
+      total_matches: matches.length,
+      matches,
+    };
+  }
+
+  /** Extrai o placar final de uma partida concluída para dois IDs externos de equipe. */
+  private extractPairScores(
+    match: PandaScoreRawMatch,
+    firstTeamId: number,
+    secondTeamId: number,
+  ): { scoreA: number; scoreB: number } {
+    const resA = match.results?.find((r) => r.team_id === firstTeamId)?.score;
+    const resB = match.results?.find((r) => r.team_id === secondTeamId)?.score;
+    if (typeof resA === 'number' && typeof resB === 'number') {
+      return { scoreA: resA, scoreB: resB };
+    }
+
+    let winsA = 0;
+    let winsB = 0;
+    for (const g of match.games ?? []) {
+      if (g.winner?.id === firstTeamId) winsA += 1;
+      if (g.winner?.id === secondTeamId) winsB += 1;
+    }
+    if (winsA > 0 || winsB > 0) {
+      return { scoreA: winsA, scoreB: winsB };
+    }
+
+    const target = match.number_of_games === 1 ? 1 : match.number_of_games === 5 ? 3 : 2;
+    if (match.winner_id === firstTeamId) return { scoreA: target, scoreB: 0 };
+    if (match.winner_id === secondTeamId) return { scoreA: 0, scoreB: target };
+    return { scoreA: 0, scoreB: 0 };
+  }
+
+  /**
+   * Monta a tabela de classificação do torneio/grupo cruzando `/standings` com
+   * as partidas concluídas do torneio (para garantir W-L e Pontos mesmo em chaves GSL).
+   */
+  private buildStandings(
+    rawStandings: PandaScoreRawStandingRow[],
+    tournamentMatches: PandaScoreRawMatch[],
+    teamAExternalId: number | null,
+    teamBExternalId: number | null,
+    teamAName: string | null,
+    teamBName: string | null,
+  ): PreMatchStandingRowDto[] {
+    // Contabiliza vitórias/derrotas reais dentro do torneio a partir dos jogos já encerrados.
+    const recordByTeamId = new Map<
+      number,
+      {
+        wins: number;
+        losses: number;
+        team: { id: number; name: string; acronym: string | null; image_url: string | null };
+      }
+    >();
+
+    for (const m of tournamentMatches) {
+      for (const oppWrap of m.opponents ?? []) {
+        const t = oppWrap.opponent;
+        if (t && !recordByTeamId.has(t.id)) {
+          recordByTeamId.set(t.id, { wins: 0, losses: 0, team: t });
+        }
+      }
+      if (m.status !== 'finished') continue;
+
+      const t1 = m.opponents?.[0]?.opponent;
+      const t2 = m.opponents?.[1]?.opponent;
+      if (!t1 || !t2) continue;
+
+      const { scoreA, scoreB } = this.extractPairScores(m, t1.id, t2.id);
+      const rec1 = recordByTeamId.get(t1.id);
+      const rec2 = recordByTeamId.get(t2.id);
+      if (m.winner_id === t1.id || scoreA > scoreB) {
+        if (rec1) rec1.wins += 1;
+        if (rec2) rec2.losses += 1;
+      } else if (m.winner_id === t2.id || scoreB > scoreA) {
+        if (rec2) rec2.wins += 1;
+        if (rec1) rec1.losses += 1;
+      }
+    }
+
+    const rows: PreMatchStandingRowDto[] = [];
+
+    if (rawStandings.length > 0) {
+      rawStandings.forEach((entry, index) => {
+        if (!entry.team) return;
+        const computed = recordByTeamId.get(entry.team.id);
+        const wins = typeof entry.wins === 'number' ? entry.wins : (computed?.wins ?? 0);
+        const losses = typeof entry.losses === 'number' ? entry.losses : (computed?.losses ?? 0);
+        const ties = typeof entry.ties === 'number' ? entry.ties : 0;
+        const points = wins * 3 + ties;
+
+        const isTeamA =
+          (teamAExternalId !== null && entry.team.id === teamAExternalId) ||
+          (teamAName !== null &&
+            entry.team.name.trim().toLowerCase() === teamAName.trim().toLowerCase());
+        const isTeamB =
+          (teamBExternalId !== null && entry.team.id === teamBExternalId) ||
+          (teamBName !== null &&
+            entry.team.name.trim().toLowerCase() === teamBName.trim().toLowerCase());
+
+        rows.push({
+          rank: entry.rank ?? index + 1,
+          team_name: entry.team.name,
+          team_acronym: entry.team.acronym ?? null,
+          team_logo_url: entry.team.image_url ?? null,
+          wins,
+          losses,
+          points,
+          is_team_a: isTeamA,
+          is_team_b: isTeamB,
+        });
+      });
+
+      return rows.sort((a, b) => a.rank - b.rank || b.points - a.points);
+    }
+
+    // Fallback com dados reais das equipes inscritas no torneio caso `/standings` ainda esteja vazio.
+    const fallbackEntries = Array.from(recordByTeamId.values()).sort(
+      (a, b) => b.wins - a.wins || a.losses - b.losses || a.team.name.localeCompare(b.team.name),
+    );
+
+    return fallbackEntries.map((item, idx) => {
+      const isTeamA =
+        (teamAExternalId !== null && item.team.id === teamAExternalId) ||
+        (teamAName !== null &&
+          item.team.name.trim().toLowerCase() === teamAName.trim().toLowerCase());
+      const isTeamB =
+        (teamBExternalId !== null && item.team.id === teamBExternalId) ||
+        (teamBName !== null &&
+          item.team.name.trim().toLowerCase() === teamBName.trim().toLowerCase());
+
+      return {
+        rank: idx + 1,
+        team_name: item.team.name,
+        team_acronym: item.team.acronym ?? null,
+        team_logo_url: item.team.image_url ?? null,
+        wins: item.wins,
+        losses: item.losses,
+        points: item.wins * 3,
+        is_team_a: isTeamA,
+        is_team_b: isTeamB,
+      };
+    });
+  }
+
+  /** Extrai e normaliza os links de transmissão (`streams_list`) com plataforma e bandeira. */
+  private buildStreamsList(
+    rawStreams: NonNullable<PandaScoreRawMatch['streams_list']>,
+  ): PreMatchStreamDto[] {
+    const seenUrls = new Set<string>();
+    const streams: PreMatchStreamDto[] = [];
+
+    for (const s of rawStreams) {
+      const url = (s.raw_url ?? s.embed_url ?? '').trim();
+      if (!url || seenUrls.has(url)) continue;
+      seenUrls.add(url);
+
+      const lower = url.toLowerCase();
+      let platform: PreMatchStreamDto['platform'] = 'other';
+      if (lower.includes('twitch.tv')) platform = 'twitch';
+      else if (lower.includes('youtube.com') || lower.includes('youtu.be')) platform = 'youtube';
+      else if (lower.includes('kick.com')) platform = 'kick';
+
+      const channelName = this.extractChannelName(url, platform);
+      const langCode = (s.language ?? 'en').trim().toLowerCase();
+
+      streams.push({
+        platform,
+        channel_name: channelName,
+        language: langCode.toUpperCase(),
+        flag_emoji: this.languageToFlagEmoji(langCode),
+        url,
+        is_official: Boolean(s.official),
+        is_main: Boolean(s.main),
+      });
+    }
+
+    return streams.sort(
+      (a, b) => Number(b.is_main) - Number(a.is_main) || Number(b.is_official) - Number(a.is_official),
+    );
+  }
+
+  private extractChannelName(url: string, platform: PreMatchStreamDto['platform']): string {
+    try {
+      const parsed = new URL(url);
+      const segments = parsed.pathname.split('/').filter(Boolean);
+      const last = segments[segments.length - 1];
+      if (last && last !== 'watch' && last !== 'channel') {
+        return last;
+      }
+    } catch {
+      // ignora URL malformada
+    }
+    if (platform === 'twitch') return 'Twitch Stream';
+    if (platform === 'youtube') return 'YouTube Live';
+    if (platform === 'kick') return 'Kick Stream';
+    return 'Transmissão Ao Vivo';
+  }
+
+  private languageToFlagEmoji(lang: string): string {
+    switch (lang) {
+      case 'pt':
+      case 'pt-br':
+        return '🇧🇷';
+      case 'en':
+        return '🇺🇸';
+      case 'ru':
+        return '🇷🇺';
+      case 'es':
+        return '🇪🇸';
+      case 'fr':
+        return '🇫🇷';
+      case 'de':
+        return '🇩🇪';
+      case 'pl':
+        return '🇵🇱';
+      case 'uk':
+        return '🇺🇦';
+      case 'da':
+        return '🇩🇰';
+      case 'sv':
+        return '🇸🇪';
+      case 'zh':
+        return '🇨🇳';
+      default:
+        return '🌐';
+    }
   }
 }

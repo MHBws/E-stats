@@ -100,12 +100,89 @@ export interface PostMatchPlayerStatDto {
   rating: number;
 }
 
+// -----------------------------------------------------------------------------
+// [UPDATE]: DTOs de Pré-Jogo Estilo Sofascore (`MatchDetailDto.preMatchStats`)
+// -----------------------------------------------------------------------------
+
+/** Canal de transmissão ao vivo extraído de `streams_list` da PandaScore. */
+export interface PreMatchStreamDto {
+  platform: 'twitch' | 'youtube' | 'kick' | 'other';
+  channel_name: string;
+  language: string;
+  flag_emoji: string;
+  url: string;
+  is_official: boolean;
+  is_main: boolean;
+}
+
+/** Um dos últimos 5 jogos finalizados de uma equipe (Form / Desempenho recente). */
+export interface PreMatchTeamFormEntryDto {
+  match_id: string;
+  date: string;
+  tournament_name: string;
+  opponent_name: string;
+  opponent_acronym: string | null;
+  team_score: number;
+  opponent_score: number;
+  /** Placar formatado do jogo histórico (ex.: `"2-0"`, `"1-2"`, `"13-9"`). */
+  score_label: string;
+  outcome: 'W' | 'L' | 'D';
+}
+
+/** Partida histórica individual do confronto direto (H2H) entre as duas equipes. */
+export interface PreMatchH2HMatchDto {
+  id: string;
+  date: string;
+  tournament_name: string;
+  team_a_name: string;
+  team_a_acronym: string | null;
+  team_a_score: number;
+  team_b_name: string;
+  team_b_acronym: string | null;
+  team_b_score: number;
+  winner_side: 'team_a' | 'team_b' | 'draw';
+}
+
+/** Resumo e lista de confrontos diretos (Head-to-Head). */
+export interface PreMatchH2HSummaryDto {
+  team_a_wins: number;
+  team_b_wins: number;
+  draws: number;
+  total_matches: number;
+  matches: PreMatchH2HMatchDto[];
+}
+
+/** Linha da tabela de classificação (`standings`) do torneio ou grupo. */
+export interface PreMatchStandingRowDto {
+  rank: number;
+  team_name: string;
+  team_acronym: string | null;
+  team_logo_url: string | null;
+  wins: number;
+  losses: number;
+  points: number;
+  is_team_a: boolean;
+  is_team_b: boolean;
+}
+
+/** Payload enriquecido pré-jogo retornado em `GET /api/matches/:id`. */
+export interface PreMatchStatsDto {
+  h2h: PreMatchH2HSummaryDto;
+  recent_form: {
+    team_a: PreMatchTeamFormEntryDto[];
+    team_b: PreMatchTeamFormEntryDto[];
+  };
+  standings: PreMatchStandingRowDto[];
+  streams: PreMatchStreamDto[];
+}
+
 /** Detalhe completo da partida retornado por `GET /api/matches/:id`. */
 export interface MatchDetailDto extends MatchCardDto {
   maps: MatchMapDetailDto[];
-  // [UPDATE]: Placar consolidado e estatísticas finais dos jogadores via PandaScore.
+  // [UPDATE]: Placar consolidado, estatísticas pós-jogo e pacote pré-jogo (H2H/Form/Standings/Streams).
   results?: MatchSeriesResultsDto;
   players_stats?: PostMatchPlayerStatDto[];
+  preMatchStats?: PreMatchStatsDto;
 }
 
 // -----------------------------------------------------------------------------

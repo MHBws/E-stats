@@ -31,6 +31,7 @@ import {
   PandaScoreAdapter,
   type PandaScorePostMatchPlayerStat,
   type PandaScoreRosterPlayer,
+  type PreMatchStatsDto,
 } from '../providers/pandascore/pandascore.adapter.js';
 
 /** Abas estilo Apple Sports suportadas pelo filtro de listagem. */
@@ -100,9 +101,10 @@ export interface MatchMapDetailDto {
 /** Detalhe completo da partida (`GET /api/matches/:id`), incluindo mapas, rosters e stats. */
 export interface MatchDetailDto extends MatchCardDto {
   maps: MatchMapDetailDto[];
-  // [UPDATE]: Placar final consolidado da série e estatísticas pós-jogo.
+  // [UPDATE]: Placar final consolidado da série, estatísticas pós-jogo e dados avançados pré-jogo (H2H, Form, Standings, Streams).
   results: MatchSeriesResultsDto;
   players_stats: PandaScorePostMatchPlayerStat[];
+  preMatchStats: PreMatchStatsDto;
 }
 
 /** Linha bruta retornada pelo JOIN de `getMatches`. */
@@ -411,29 +413,39 @@ export class MatchService {
       teamBMapsWon: maps.filter((m) => m.status === 'finished' && m.team_b_score > m.team_a_score).length,
     });
 
-    // [UPDATE]: Busca rosters reais (`players`) e estatísticas pós-jogo (`players_stats`)
-    // via PandaScore API.
-    const { teamAPlayers, teamBPlayers, playersStats } =
-      await this.pandaAdapter.fetchMatchRostersAndStats({
+    const teamARef = baseCard.team_a
+      ? {
+          id: baseCard.team_a.id,
+          name: baseCard.team_a.name,
+          acronym: baseCard.team_a.acronym,
+        }
+      : null;
+    const teamBRef = baseCard.team_b
+      ? {
+          id: baseCard.team_b.id,
+          name: baseCard.team_b.name,
+          acronym: baseCard.team_b.acronym,
+        }
+      : null;
+
+    // [UPDATE]: Dispara simultaneamente (`Promise.all`) a busca de rosters/stats e
+    // o enriquecimento relacional `preMatchStats` (H2H, Form, Standings e Streams).
+    const [{ teamAPlayers, teamBPlayers, playersStats }, preMatchStats] = await Promise.all([
+      this.pandaAdapter.fetchMatchRostersAndStats({
         matchId: baseCard.id,
         status: baseCard.status,
         winnerId: baseCard.winner_id,
-        teamA: baseCard.team_a
-          ? {
-              id: baseCard.team_a.id,
-              name: baseCard.team_a.name,
-              acronym: baseCard.team_a.acronym,
-            }
-          : null,
-        teamB: baseCard.team_b
-          ? {
-              id: baseCard.team_b.id,
-              name: baseCard.team_b.name,
-              acronym: baseCard.team_b.acronym,
-            }
-          : null,
+        teamA: teamARef,
+        teamB: teamBRef,
         mapsCount: maps.filter((m) => m.status === 'finished').length || maps.length,
-      });
+      }),
+      this.pandaAdapter.fetchPreMatchStats({
+        matchId: baseCard.id,
+        tournamentId: baseCard.tournament.id,
+        teamA: teamARef,
+        teamB: teamBRef,
+      }),
+    ]);
 
     return {
       ...baseCard,
@@ -452,6 +464,7 @@ export class MatchService {
       maps,
       results,
       players_stats: playersStats,
+      preMatchStats,
     };
   }
 }
